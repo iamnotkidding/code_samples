@@ -1,0 +1,10 @@
+{
+  "temp": {
+    "min_rows": 3,
+    "min_val": 0.0
+  },
+  "humid": {
+    "min_rows": 3,
+    "min_val": 0.0
+  }
+}
