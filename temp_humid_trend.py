@@ -43,10 +43,16 @@ def save_config(cfg: dict):
 def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
     """
     UP/DOWN 추세 분석.
+
     노이즈 조건:
       1) 값이 min_val 이하인 구간 전체
       2) UP/DOWN 길이 < min_rows
-      3) flat(동일값) 길이 >= min_rows → 해당 구간 빈값, 앞뒤 방향 전파 차단
+      3) flat(동일값) 길이 >= min_rows → BARRIER (해당 구간 "", 앞뒤 전파 차단)
+
+    flat 구간(noise 포함) 처리 원칙:
+      - flat은 방향이 없으므로 앞 방향을 계승하지 않음
+      - 뒤에 유효한 UP/DOWN 구간이 있으면 그 방향을 따름
+      - 뒤에도 없고 앞에도 없으면 ""
     """
     n = len(values)
     if n == 0:
@@ -64,6 +70,7 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
         d = raw[i]; j = i
         while j < n and raw[j] == d: j += 1
         segments.append((i, j - 1, d)); i = j
+    S = len(segments)
 
     low_set = {k for k, v in enumerate(values) if v <= min_val}
 
@@ -78,56 +85,63 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
         """동일값 구간이 min_rows 이상 → 방향 전파 차단"""
         return seg_dir(si) == "" and seg_len(si) >= min_rows
 
-    def is_noise(si):
-        """짧은 UP/DOWN 또는 min_val 이하"""
-        if is_low(si): return True
+    def is_valid(si):
+        """유효한 UP/DOWN 구간 (노이즈 아님, min_val 아님)"""
         d = seg_dir(si)
-        return d in ("UP", "DOWN") and seg_len(si) < min_rows
+        return d in ("UP", "DOWN") and not is_low(si) and seg_len(si) >= min_rows
 
-    # Step3: 각 구간의 확정 방향 계산
-    #   flat barrier  → BARRIER 마커 (전파 차단점)
-    #   유효 UP/DOWN  → 해당 방향
-    #   노이즈/짧은flat → None (이웃으로부터 채울 예정)
+    def is_flat_noise(si):
+        """flat 이지만 barrier 아닌 짧은 구간"""
+        return seg_dir(si) == "" and not is_flat_barrier(si)
+
+    def is_short_noise(si):
+        """UP/DOWN 이지만 너무 짧거나 min_val 이하"""
+        return not is_valid(si) and not is_flat_barrier(si) and not is_flat_noise(si)
+
+    # Step3: 각 구간 분류
+    #   BARRIER   : flat >= min_rows  → "" 확정, 전파 차단
+    #   VALID     : 유효 UP/DOWN      → 방향 확정
+    #   NOISE     : 짧은 UP/DOWN, low → 인접 채움
+    #   FLAT_NOISE: 짧은 flat         → 뒤 방향 우선, 없으면 앞
+
     BARRIER = "__BARRIER__"
-    resolved = []
-    for si in range(len(segments)):
-        if is_flat_barrier(si):
-            resolved.append(BARRIER)
-        elif not is_noise(si) and seg_dir(si) in ("UP", "DOWN"):
-            resolved.append(seg_dir(si))
-        else:
-            resolved.append(None)
+    resolved = [None] * S
+    for si in range(S):
+        if is_flat_barrier(si):  resolved[si] = BARRIER
+        elif is_valid(si):       resolved[si] = seg_dir(si)
+        # else: None — 나중에 채움
 
-    # Step4: 앞→뒤 전파
-    #   barrier를 만나면 전파값 리셋, None 구간은 현재 전파값으로 채움
-    last = ""
-    for si in range(len(segments)):
-        if resolved[si] == BARRIER:
-            last = ""                    # 차단 — 이후 전파 초기화
-        elif resolved[si] is not None:
-            last = resolved[si]          # 유효 방향 갱신
-        else:
-            resolved[si] = last          # 노이즈 구간 채움
-
-    # Step5: 뒤→앞 전파 (앞에 유효 방향이 없었던 경우)
-    #   barrier를 만나면 역전파값 리셋
+    # Step4: 뒤→앞 전파 (flat_noise는 뒤 방향 우선)
+    #   barrier를 만나면 역방향 초기화
     nxt = ""
-    for si in range(len(segments) - 1, -1, -1):
+    for si in range(S - 1, -1, -1):
         if resolved[si] == BARRIER:
-            nxt = ""                     # 차단 — 역방향 전파 초기화
-        elif resolved[si] not in ("", None, BARRIER):
-            nxt = resolved[si]           # 유효 방향 갱신
-        elif resolved[si] == "":
-            resolved[si] = nxt           # 앞에 방향 없던 노이즈 채움
+            nxt = ""
+        elif resolved[si] in ("UP", "DOWN"):
+            nxt = resolved[si]
+        elif resolved[si] is None:
+            # flat_noise 또는 short_noise: 뒤 방향으로 채움
+            resolved[si] = nxt
 
-    # Step6: BARRIER → 빈값 확정, 결과 배열 구성
+    # Step5: 앞→뒤 전파 (뒤에 방향이 없어서 "" 로 남은 구간 채움)
+    #   barrier를 만나면 전방향 초기화
+    last = ""
+    for si in range(S):
+        if resolved[si] == BARRIER:
+            last = ""
+        elif resolved[si] in ("UP", "DOWN"):
+            last = resolved[si]
+        elif resolved[si] == "":
+            # 뒤→앞에서도 채워지지 않은 경우 (앞에 유효값이 있으면 계승)
+            resolved[si] = last
+
+    # Step6: 결과 배열
     result = [""] * n
     for si, (s, e, _) in enumerate(segments):
         val = "" if resolved[si] == BARRIER else (resolved[si] or "")
         for k in range(s, e + 1):
             result[k] = val
     return result
-
 
 # ══════════════════════════════════════════════
 # WIN32 헬퍼
