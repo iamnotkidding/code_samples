@@ -733,18 +733,25 @@ class App(tk.Tk):
         for w in self.sf.winfo_children(): w.destroy()
         self._sheet_rows.clear()
         self._log("시트 목록 로드 중 (win32)...")
-        self.update_idletasks()
-        try:
-            names = get_sheet_names(path)
-        except Exception as e:
-            messagebox.showerror("오류", f"파일 읽기 실패:\n{e}"); return
+        self._set_running(True)
+
+        def worker():
+            try:
+                names   = get_sheet_names(path)
+                detected = detect_format(path, self.config_data["formats"])
+                self.after(0, lambda: self._on_load_done(path, names, detected))
+            except Exception as e:
+                self.after(0, lambda err=e: self._on_load_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_load_done(self, path, names, detected):
+        self._set_running(False)
         for i, sname in enumerate(names):
             sr = SheetRow(self.sf, sname, self.BG, self.FG, self.LF, i)
             self._sheet_rows.append(sr)
         self._log(f"로드 완료: {len(names)}개 시트 — " + ", ".join(names))
-        # 포맷 자동 인식 결과 표시
         try:
-            detected = detect_format(path, self.config_data["formats"])
             fmt = self.config_data["formats"][detected]
             col_map = fmt.get("columns", {})
             col_str = "  ".join(f"{k}={v!r}" for k, v in col_map.items() if v)
@@ -756,6 +763,10 @@ class App(tk.Tk):
         except Exception as e:
             self.fmt_info_var.set("(인식 실패)")
             self._log(f"포맷 인식 실패: {e}")
+
+    def _on_load_error(self, err):
+        self._set_running(False)
+        messagebox.showerror("오류", f"파일 읽기 실패:\n{err}")
 
     def _save_cfg(self):
         try:
