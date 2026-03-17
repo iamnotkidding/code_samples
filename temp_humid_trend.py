@@ -788,14 +788,21 @@ class App(tk.Tk):
             self._sheet_rows.append(sr)
         self._log(f"로드 완료: {len(names)}개 시트 — " + ", ".join(names))
         try:
-            fmt = self.config_data["formats"][detected]
+            fmt     = self.config_data["formats"][detected]
             col_map = fmt.get("columns", {})
-            col_str = "  ".join(f"{k}={v!r}" for k, v in col_map.items() if v)
+            t_col   = col_map.get("temp",  "")
+            h_col   = col_map.get("humid", "")
+
+            # fmt_info_var: 포맷 키 + 행 정보
             self.fmt_info_var.set(
                 f"[{detected}]  헤더={fmt['header_row']}행  "
-                f"데이터={fmt['data_start_row']}행  {col_str}")
+                f"데이터={fmt['data_start_row']}행")
             self._detected_fmt = detected
+
+            # 로그: 포맷 설명 + 인식된 온도/습도 컬럼명
             self._log(f"포맷 자동 인식: [{detected}] {fmt.get('description','')}")
+            self._log(f"  🌡 온도 컬럼: '{t_col}'")
+            self._log(f"  💧 습도 컬럼: '{h_col}'")
         except Exception as e:
             self.fmt_info_var.set("(인식 실패)")
             self._log(f"포맷 인식 실패: {e}")
