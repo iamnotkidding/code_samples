@@ -204,16 +204,25 @@ def detect_format(filepath: str, formats: dict) -> tuple:
         col_map = fmt.get("columns", {})
         matched = {}
         for role in ("temp", "humid"):
-            cfg_name = col_map.get(role, "").strip().lower()
-            if not cfg_name:
-                matched[role] = None
-                continue
+            cfg_val = col_map.get(role, "")
+            if cfg_val is None:
+                cfg_val = ""
+            cfg_name = cfg_val.strip().lower()
+
             found = None
-            for orig in best_headers_raw:
-                lo = orig.lower()
-                if cfg_name in lo or lo in cfg_name:
-                    found = orig
-                    break
+            if cfg_name == "":
+                # config 값이 빈 문자열 → 헤더도 빈 문자열인 첫 번째 셀
+                for orig in best_headers_raw:
+                    if orig.strip() == "":
+                        found = ""   # 빈 셀 찾음 (None과 구분하기 위해 "" 반환)
+                        break
+            else:
+                # config 값이 있으면 부분 문자열 매칭
+                for orig in best_headers_raw:
+                    lo = orig.lower()
+                    if cfg_name in lo or lo in cfg_name:
+                        found = orig
+                        break
             matched[role] = found   # None 이면 못 찾은 것
 
         return best_key, matched
@@ -273,12 +282,22 @@ def read_sheet(filepath: str, sheet_name: str,
         ]
 
         def col_of(name: str) -> int:
-            """config 컬럼명이 헤더에 포함되거나 헤더가 config명에 포함되면 일치"""
-            name = name.strip().lower()
-            if not name: return -1
+            """
+            config 값이 "" → 헤더가 빈 문자열인 첫 번째 열 반환
+            config 값이 있음 → 부분 문자열 포함 매칭 (대소문자 무시)
+            찾지 못하면 -1 반환
+            """
+            name_stripped = name.strip()
+            if name_stripped == "":
+                # 빈 문자열 config → 헤더가 빈 셀인 첫 번째 열
+                for i, h in enumerate(headers):
+                    if h.strip() == "":
+                        return i + 1
+                return -1
+            name_low = name_stripped.lower()
             for i, h in enumerate(headers):
                 hl = h.lower()
-                if name in hl or hl in name:
+                if name_low in hl or hl in name_low:
                     return i + 1
             return -1
 
@@ -827,19 +846,24 @@ class App(tk.Tk):
             self._detected_fmt = detected
             self._log(f"포맷 자동 인식: [{detected}] {fmt.get('description','')}")
 
-            # 온도 컬럼
-            t_found = matched_cols.get("temp")
-            if t_found:
-                self._log(f"  🌡 온도 컬럼: '{t_found}'")
-            else:
-                self._log_error(f"  🌡 온도 컬럼: 찾을 수 없음 (config: '{fmt.get('columns',{}).get('temp','')}')")
+            cols_cfg = fmt.get("columns", {})
 
-            # 습도 컬럼
-            h_found = matched_cols.get("humid")
-            if h_found:
-                self._log(f"  💧 습도 컬럼: '{h_found}'")
-            else:
-                self._log_error(f"  💧 습도 컬럼: 찾을 수 없음 (config: '{fmt.get('columns',{}).get('humid','')}')")
+            def log_col(role, icon):
+                found    = matched_cols.get(role)
+                cfg_val  = cols_cfg.get(role, "")
+                if found is None:
+                    # 못 찾음
+                    self._log_error(
+                        f"  {icon} {role} 컬럼: 찾을 수 없음"
+                        f" (config: '{cfg_val}')")
+                elif found == "":
+                    # 빈 셀 매칭 성공
+                    self._log(f"  {icon} {role} 컬럼: (빈 셀)")
+                else:
+                    self._log(f"  {icon} {role} 컬럼: '{found}'")
+
+            log_col("temp",  "🌡")
+            log_col("humid", "💧")
 
         except Exception as e:
             self.fmt_info_var.set("(인식 실패)")
