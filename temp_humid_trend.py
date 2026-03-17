@@ -211,14 +211,17 @@ def detect_format(filepath: str, formats: dict) -> tuple:
 
             found = None
             if cfg_name == "":
-                # config 값이 빈 문자열 → 헤더도 빈 문자열인 첫 번째 셀
+                # config 값이 "" → 헤더도 빈 문자열인 첫 번째 셀만 매치
                 for orig in best_headers_raw:
                     if orig.strip() == "":
-                        found = ""   # 빈 셀 찾음 (None과 구분하기 위해 "" 반환)
+                        found = ""
                         break
             else:
                 # config 값이 있으면 부분 문자열 매칭
+                # 단, 헤더가 빈 문자열인 셀은 매치 대상에서 제외
                 for orig in best_headers_raw:
+                    if orig.strip() == "":
+                        continue   # 빈 헤더는 config가 ""일 때만 매치
                     lo = orig.lower()
                     if cfg_name in lo or lo in cfg_name:
                         found = orig
@@ -283,19 +286,22 @@ def read_sheet(filepath: str, sheet_name: str,
 
         def col_of(name: str) -> int:
             """
-            config 값이 "" → 헤더가 빈 문자열인 첫 번째 열 반환
+            config 값이 "" → 헤더가 빈 문자열인 첫 번째 열만 매치
             config 값이 있음 → 부분 문자열 포함 매칭 (대소문자 무시)
+                              단, 헤더가 빈 문자열인 셀은 제외
             찾지 못하면 -1 반환
             """
             name_stripped = name.strip()
             if name_stripped == "":
-                # 빈 문자열 config → 헤더가 빈 셀인 첫 번째 열
+                # config "" → 빈 헤더 셀만 매치
                 for i, h in enumerate(headers):
                     if h.strip() == "":
                         return i + 1
                 return -1
             name_low = name_stripped.lower()
             for i, h in enumerate(headers):
+                if h.strip() == "":
+                    continue   # 빈 헤더는 config가 ""일 때만 매치
                 hl = h.lower()
                 if name_low in hl or hl in name_low:
                     return i + 1
