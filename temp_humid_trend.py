@@ -10,6 +10,7 @@ Excel Trend Analyzer — Temperature & Humidity
 
 import json
 import os
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -20,7 +21,13 @@ import win32com.client
 # ══════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════
-CONFIG_FILE = os.path.splitext(os.path.abspath(__file__))[0] + ".json"
+# PyInstaller exe 빌드 시 sys.frozen 이 True로 설정됨
+# exe: sys.executable 기준 경로 사용
+# .py: __file__ 기준 경로 사용
+if getattr(sys, "frozen", False):
+    CONFIG_FILE = os.path.splitext(os.path.abspath(sys.executable))[0] + ".json"
+else:
+    CONFIG_FILE = os.path.splitext(os.path.abspath(__file__))[0] + ".json"
 
 
 def load_config() -> dict:
