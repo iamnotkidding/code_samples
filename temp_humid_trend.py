@@ -13,6 +13,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import threading
 import win32com.client
 
 
@@ -40,50 +41,87 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
-def analyze_trends(values: list, min_rows: int) -> list:
+def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
     """
-    UP/DOWN 추세 분석.
+    UP/DOWN 추세 분석 (4단계).
 
-    규칙:
-      1. 이전 값보다 크면 UP, 작으면 DOWN (동일값은 방향 없음)
-      2. 같은 방향이 연속으로 min_rows 개 이상인 구간만 유효
-      3. 유효하지 않은 구간(짧거나 flat)은 빈칸("")
-      4. min_val 기준 없음
+    Step1: 값 비교로 raw 방향 결정
+           values[i] > values[i-1] → UP
+           values[i] < values[i-1] → DOWN
+           values[i] == values[i-1] → "" (flat)
+           index 0 은 항상 ""
 
-    첫 번째 행은 이전 값이 없으므로 다음 행과 같은 방향으로 처리.
+    Step2: UP 구간 사이에 flat이 cont_rows 이하면 UP으로 채움
+           (UP ... flat×N ... UP  →  N <= cont_rows 이면 flat을 UP으로)
+
+    Step3: DOWN 구간 사이에 flat이 cont_rows 이하면 DOWN으로 채움
+
+    Step4: 연속 UP/DOWN 길이가 min_rows 미만이면 "" (ignore)
     """
     n = len(values)
     if n == 0:
         return []
 
-    # Step1: 인접 비교 → UP / DOWN / "" (flat)
-    # index 0은 index 1과 같은 방향으로 채움 (이전 값 없음)
+    # ── Step1: 인접 비교로 raw 방향 ─────────────────────────
     raw = [""] * n
     for i in range(1, n):
         if   values[i] > values[i - 1]: raw[i] = "UP"
         elif values[i] < values[i - 1]: raw[i] = "DOWN"
-    if n >= 2:
-        raw[0] = raw[1]   # 첫 행 = 두 번째 행 방향
 
-    # Step2: 연속 구간 추출
+    # ── Step2 & 3: 방향 사이 flat 채움 ──────────────────────
+    def fill_flat_between(direction: str, data: list) -> list:
+        """
+        같은 direction 구간 사이에 끼인 flat("") 구간이
+        cont_rows 이하면 해당 방향으로 채움.
+        """
+        result = data[:]
+        i = 0
+        while i < n:
+            if result[i] != direction:
+                i += 1
+                continue
+            # direction 구간 끝 찾기
+            j = i
+            while j < n and result[j] == direction:
+                j += 1
+            # j부터 flat 구간 길이 측정
+            k = j
+            while k < n and result[k] == "":
+                k += 1
+            flat_len = k - j
+            # flat 뒤가 같은 direction 이고 flat 길이 <= cont_rows 이면 채움
+            if k < n and result[k] == direction and flat_len <= cont_rows:
+                for idx in range(j, k):
+                    result[idx] = direction
+                i = k  # 채운 구간 이후부터 재탐색
+            else:
+                i = j
+        return result
+
+    # UP 사이 flat 채움
+    filled = fill_flat_between("UP",   raw)
+    # DOWN 사이 flat 채움
+    filled = fill_flat_between("DOWN", filled)
+
+    # ── Step4: min_rows 미만 구간 → "" (ignore) ─────────────
+    # 연속 구간 추출
     segments = []
     i = 0
     while i < n:
-        d = raw[i]; j = i
-        while j < n and raw[j] == d:
+        d = filled[i]; j = i
+        while j < n and filled[j] == d:
             j += 1
         segments.append((i, j - 1, d))
         i = j
 
-    # Step3: min_rows 이상인 UP/DOWN 구간만 유효, 나머지 빈칸
     result = [""] * n
     for s, e, d in segments:
         if d in ("UP", "DOWN") and (e - s + 1) >= min_rows:
             for k in range(s, e + 1):
                 result[k] = d
+        # min_rows 미만 또는 flat → "" 유지
 
     return result
-
 
 
 # ══════════════════════════════════════════════
@@ -256,7 +294,11 @@ def write_trend_col(ws, header_row: int, data_start_row: int,
 # 전체 파일 처리
 # ══════════════════════════════════════════════
 def process_all_sheets(filepath: str, sheet_cfg_map: dict,
-                       config: dict, status_cb=None):
+                       config: dict, status_cb=None, sheet_result_cb=None):
+    """
+    sheet_result_cb(sheet_name, t_up, t_down, h_up, h_down):
+        각 시트 처리 완료 시 UP/DOWN 카운트를 UI로 전달
+    """
     def log(msg):
         if status_cb: status_cb(msg)
 
@@ -296,31 +338,38 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             ws = wb.Sheets(sheet_name)
             sheet_done = False
+            _t_up = _t_down = _h_up = _h_down = 0
 
             if temp_vals:
                 trends = analyze_trends(temp_vals,
-                                        int(t_cfg["min_rows"]))
+                                        int(t_cfg["min_rows"]),
+                                        int(t_cfg["cont_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Temp_Trend", trends)
-                log(f"  [{sheet_name}] 🌡 온도  "
-                    f"UP={trends.count('UP')}, DOWN={trends.count('DOWN')}")
+                _t_up   = trends.count('UP')
+                _t_down = trends.count('DOWN')
+                log(f"  [{sheet_name}] 🌡 온도  UP={_t_up}, DOWN={_t_down}")
                 sheet_done = True
             else:
                 log(f"  [{sheet_name}] 🌡 온도 컬럼 없음")
 
             if humid_vals:
                 trends = analyze_trends(humid_vals,
-                                        int(h_cfg["min_rows"]))
+                                        int(h_cfg["min_rows"]),
+                                        int(h_cfg["cont_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Humid_Trend", trends)
-                log(f"  [{sheet_name}] 💧 습도  "
-                    f"UP={trends.count('UP')}, DOWN={trends.count('DOWN')}")
+                _h_up   = trends.count('UP')
+                _h_down = trends.count('DOWN')
+                log(f"  [{sheet_name}] 💧 습도  UP={_h_up}, DOWN={_h_down}")
                 sheet_done = True
             else:
                 log(f"  [{sheet_name}] 💧 습도 컬럼 없음")
 
             if sheet_done:
                 processed.append(sheet_name)
+                if sheet_result_cb:
+                    sheet_result_cb(sheet_name, _t_up, _t_down, _h_up, _h_down)
 
         xl.ScreenUpdating = True
         wb.Save()
@@ -414,15 +463,21 @@ class SensorConfigFrame(tk.LabelFrame):
                          bg=bg, fg=fg, bd=1, relief="groove",
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
-        self.min_rows_var = tk.StringVar(value=str(init.get("min_rows", 3)))
-        tk.Label(self, text="min_rows  (최소 연속 행)", font=lf, bg=bg, fg=fg).grid(
-            row=0, column=0, sticky="e", padx=(0, 6), pady=3)
-        tk.Entry(self, textvariable=self.min_rows_var, width=10,
-                 bg=ebg, fg=fg, insertbackground=fg,
-                 relief="flat").grid(row=0, column=1, sticky="w", pady=3)
+        self.min_rows_var  = tk.StringVar(value=str(init.get("min_rows",  3)))
+        self.cont_rows_var = tk.StringVar(value=str(init.get("cont_rows", 1)))
+        for i, (lbl, var) in enumerate([
+            ("min_rows  (UP/DOWN 최소 연속 행)", self.min_rows_var),
+            ("cont_rows (flat 허용 연속 행)",    self.cont_rows_var),
+        ]):
+            tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
+                row=i, column=0, sticky="e", padx=(0, 6), pady=3)
+            tk.Entry(self, textvariable=var, width=10,
+                     bg=ebg, fg=fg, insertbackground=fg,
+                     relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"min_rows": int(self.min_rows_var.get())}
+        return {"min_rows":  int(self.min_rows_var.get()),
+                "cont_rows": int(self.cont_rows_var.get())}
 
 
 # ══════════════════════════════════════════════
@@ -432,11 +487,23 @@ class SheetRow:
     def __init__(self, parent, sheet_name, bg, fg, lf, row_idx):
         self.sheet_name = sheet_name
         self.enabled = tk.BooleanVar(value=True)
+        self._result_var = tk.StringVar(value="")
+
         tk.Checkbutton(parent, variable=self.enabled, bg=bg, fg=fg,
                        selectcolor="#313244", activebackground=bg).grid(
             row=row_idx, column=0, padx=(6, 2))
         tk.Label(parent, text=sheet_name, font=lf, bg=bg, fg=fg,
-                 width=28, anchor="w").grid(row=row_idx, column=1, padx=6)
+                 width=20, anchor="w").grid(row=row_idx, column=1, padx=4)
+        tk.Label(parent, textvariable=self._result_var,
+                 font=("Consolas", 9), bg=bg, fg="#A6E3A1",
+                 width=30, anchor="w").grid(row=row_idx, column=2, padx=4)
+
+    def set_result(self, t_up, t_down, h_up, h_down):
+        self._result_var.set(
+            f"🌡UP={t_up} DN={t_down}  💧UP={h_up} DN={h_down}")
+
+    def clear_result(self):
+        self._result_var.set("")
 
     def get(self): return {"enabled": self.enabled.get()}
 
@@ -514,7 +581,7 @@ class App(tk.Tk):
                  bg=self.BG, fg="#A6E3A1").pack(pady=(0, 2))
 
         hf = tk.Frame(self, bg=self.BG); hf.pack(fill="x", padx=P)
-        for col, txt, w in [(0,"적용",4),(1,"시트명",28)]:
+        for col, txt, w in [(0,"적용",4),(1,"시트명",20),(2,"분석 결과",30)]:
             tk.Label(hf, text=txt, font=("Segoe UI", 9, "bold"),
                      bg="#313244", fg="#A6ADC8", width=w,
                      padx=4, pady=2).grid(row=0, column=col, padx=2, pady=(0,2))
@@ -649,8 +716,8 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}\n"
-                f"  💧 humid: min_rows={cfg['humid']['min_rows']}")
+                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, cont_rows={cfg['temp']['cont_rows']}\n"
+                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, cont_rows={cfg['humid']['cont_rows']}")
         except ValueError:
             messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
@@ -669,20 +736,54 @@ class App(tk.Tk):
 
         sheet_cfg_map = {sr.sheet_name: sr.get() for sr in self._sheet_rows}
 
+        # 결과 표시 초기화
+        for sr in self._sheet_rows:
+            sr.clear_result()
+
         self._log("═" * 56)
         self._log(f"파일: {os.path.basename(filepath)}")
+        self._set_running(True)
 
-        def status(msg):
-            self._log(msg); self.update_idletasks()
+        # 시트별 결과를 UI 스레드에 안전하게 반영
+        sr_map = {sr.sheet_name: sr for sr in self._sheet_rows}
 
-        try:
-            _, done = process_all_sheets(
-                filepath, sheet_cfg_map, cfg, status_cb=status)
-            messagebox.showinfo(
-                "완료",
-                f"분석 완료!\n처리 시트: {len(done)}개\n저장: {os.path.basename(filepath)}")
-        except Exception as e:
-            self._log(f"[오류] {e}"); messagebox.showerror("오류", str(e))
+        def on_sheet_result(sheet_name, t_up, t_down, h_up, h_down):
+            sr = sr_map.get(sheet_name)
+            if sr:
+                self.after(0, lambda: sr.set_result(t_up, t_down, h_up, h_down))
+
+        def on_log(msg):
+            self.after(0, lambda m=msg: self._log(m))
+
+        def worker():
+            try:
+                _, done = process_all_sheets(
+                    filepath, sheet_cfg_map, cfg,
+                    status_cb=on_log,
+                    sheet_result_cb=on_sheet_result)
+                self.after(0, lambda: self._on_done(len(done), filepath))
+            except Exception as e:
+                self.after(0, lambda err=e: self._on_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_running(self, running: bool):
+        state = "disabled" if running else "normal"
+        for w in self.winfo_children():
+            try: w.configure(state=state)
+            except: pass
+
+    def _on_done(self, count: int, filepath: str):
+        self._set_running(False)
+        self._log(f"✅ 완료: {count}개 시트 처리")
+        messagebox.showinfo(
+            "완료",
+            f"분석 완료!\n처리 시트: {count}개\n저장: {os.path.basename(filepath)}")
+
+    def _on_error(self, err: Exception):
+        self._set_running(False)
+        self._log(f"[오류] {err}")
+        messagebox.showerror("오류", str(err))
 
     def _log(self, msg):
         self.log_box.configure(state="normal")
