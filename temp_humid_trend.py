@@ -5,12 +5,11 @@ Excel Trend Analyzer — Temperature & Humidity
 - 3가지 입력 포맷 지원 (config.json)
 - 전체 시트 각각 독립 처리
 - 온도 / 습도 각각 독립 min_rows, min_val
-- 결과: Temp_Trend / Humid_Trend 컬럼 추가 후 _trend.xlsx 저장
+- 결과: 입력 파일에 직접 Temp_Trend / Humid_Trend 컬럼 추가 후 저장
 """
 
 import json
 import os
-import shutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -22,52 +21,15 @@ import win32com.client
 # ══════════════════════════════════════════════
 CONFIG_FILE = "config.json"
 
-DEFAULT_CONFIG = {
-    "input_format": "format1",
-    "formats": {
-        "format1": {
-            "description": "Time, temp, humidity  (헤더 1행, 데이터 2행~)",
-            "header_row": 1,
-            "data_start_row": 2,
-            "columns": {"time": "Time", "temp": "temp", "humid": "humidity"}
-        },
-        "format2": {
-            "description": "Date, Time, temp, humid  (헤더 1행, 데이터 2행~, Date: yyyy/mm/dd)",
-            "header_row": 1,
-            "data_start_row": 2,
-            "columns": {"date": "Date", "time": "Time", "temp": "temp", "humid": "humid"}
-        },
-        "format3": {
-            "description": "빈칸, 시각, TEMP, HUMI  (헤더 1행, 데이터 2행~)",
-            "header_row": 1,
-            "data_start_row": 2,
-            "columns": {"index": "", "time": "시각", "temp": "TEMP", "humid": "HUMI"}
-        }
-    },
-    "temp":  {"min_rows": 3, "min_val": 0.0},
-    "humid": {"min_rows": 3, "min_val": 0.0},
-}
-
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        raise FileNotFoundError(
+            f"config.json 파일이 없습니다.\n"
+            f"실행 경로에 config.json 을 생성한 후 다시 시작하세요.\n"
+            f"경로: {os.path.abspath(CONFIG_FILE)}")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    cfg = {"input_format": raw.get("input_format", DEFAULT_CONFIG["input_format"]),
-           "formats": {}}
-    for k, v in DEFAULT_CONFIG["formats"].items():
-        merged = json.loads(json.dumps(v))
-        merged.update(raw.get("formats", {}).get(k, {}))
-        cfg["formats"][k] = merged
-    for k, v in raw.get("formats", {}).items():
-        if k not in cfg["formats"]:
-            cfg["formats"][k] = v
-    for sensor in ("temp", "humid"):
-        base = DEFAULT_CONFIG[sensor].copy()
-        base.update(raw.get(sensor, {}))
-        cfg[sensor] = base
-    return cfg
+        return json.load(f)
 
 
 def save_config(cfg: dict):
@@ -126,11 +88,18 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
 # WIN32 헬퍼
 # ══════════════════════════════════════════════
 def _xl_open(filepath: str, visible=False):
+    """Excel Application 열기 — 대용량 최적화 옵션 적용"""
     xl = win32com.client.Dispatch("Excel.Application")
-    xl.Visible = False
-    xl.DisplayAlerts = False
+    xl.Visible        = False
+    xl.DisplayAlerts  = False
     xl.ScreenUpdating = False
-    wb = xl.Workbooks.Open(os.path.abspath(filepath))
+    xl.EnableEvents   = False          # 이벤트 핸들러 비활성
+    xl.Calculation    = -4135          # xlCalculationManual: 자동계산 OFF
+    wb = xl.Workbooks.Open(
+        os.path.abspath(filepath),
+        UpdateLinks=False,             # 외부 링크 갱신 안 함
+        ReadOnly=False,
+    )
     return xl, wb
 
 
@@ -146,20 +115,27 @@ def read_sheet(filepath: str, sheet_name: str,
                header_row: int, data_start_row: int,
                temp_col_name: str, humid_col_name: str):
     """
-    win32com으로 시트 읽기.
+    win32com으로 시트 읽기 (대용량 최적화).
+    - 헤더: Range 1행 일괄 읽기
+    - 데이터: 컬럼 단위 Range.Value 일괄 읽기 (셀 루프 없음)
     반환: (temp_vals: list[float], humid_vals: list[float])
     """
     xl, wb = _xl_open(filepath)
     try:
-        ws        = wb.Sheets(sheet_name)
-        last_col  = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
-        last_row  = ws.UsedRange.Row    + ws.UsedRange.Rows.Count    - 1
+        ws       = wb.Sheets(sheet_name)
+        ur       = ws.UsedRange
+        last_col = ur.Column + ur.Columns.Count - 1
+        last_row = ur.Row    + ur.Rows.Count    - 1
 
-        # 헤더
+        # 헤더 행 일괄 읽기
+        hdr_range = ws.Range(
+            ws.Cells(header_row, 1),
+            ws.Cells(header_row, last_col)
+        )
+        hdr_raw = hdr_range.Value  # tuple of tuples (1 row)
         headers = [
-            str(ws.Cells(header_row, c).Value).strip()
-            if ws.Cells(header_row, c).Value is not None else ""
-            for c in range(1, last_col + 1)
+            str(v).strip() if v is not None else ""
+            for v in (hdr_raw[0] if hdr_raw else [])
         ]
 
         def col_of(name: str) -> int:
@@ -172,37 +148,55 @@ def read_sheet(filepath: str, sheet_name: str,
         t_ci = col_of(temp_col_name)
         h_ci = col_of(humid_col_name)
 
-        def read(ci: int) -> list:
-            if ci < 1: return []
+        def read_col(ci: int) -> list:
+            """컬럼 전체를 Range.Value 단일 호출로 일괄 읽기"""
+            if ci < 1:
+                return []
+            col_range = ws.Range(
+                ws.Cells(data_start_row, ci),
+                ws.Cells(last_row, ci)
+            )
+            raw = col_range.Value  # tuple of 1-element tuples
             out = []
-            for r in range(data_start_row, last_row + 1):
-                v = ws.Cells(r, ci).Value
+            for row_tuple in (raw or []):
+                v = row_tuple[0] if isinstance(row_tuple, tuple) else row_tuple
                 try:    out.append(float(v) if v is not None else 0.0)
                 except: out.append(0.0)
             return out
 
-        return read(t_ci), read(h_ci)
+        return read_col(t_ci), read_col(h_ci)
     finally:
         wb.Close(False); xl.Quit()
 
 
 def write_trend_col(ws, header_row: int, data_start_row: int,
                     col_name: str, trends: list):
-    """결과 컬럼을 값만 기록 (스타일 없음)"""
-    last_col = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+    """결과 컬럼을 값만 기록 (대용량 최적화: Range 일괄 쓰기)"""
+    ur       = ws.UsedRange
+    last_col = ur.Column + ur.Columns.Count - 1
 
-    # 기존 동일 헤더 컬럼 찾기
+    # 기존 동일 헤더 컬럼 찾기 (헤더 행 일괄 읽기)
+    hdr_range = ws.Range(ws.Cells(header_row, 1),
+                         ws.Cells(header_row, last_col))
+    hdr_raw   = hdr_range.Value
+    headers   = [str(v).strip() if v is not None else ""
+                 for v in (hdr_raw[0] if hdr_raw else [])]
     col = None
-    for c in range(1, last_col + 1):
-        v = ws.Cells(header_row, c).Value
-        if v is not None and str(v).strip() == col_name:
-            col = c; break
+    for i, h in enumerate(headers):
+        if h == col_name:
+            col = i + 1; break
     if col is None:
         col = last_col + 1
 
+    # 헤더 쓰기
     ws.Cells(header_row, col).Value = col_name
-    for i, trend in enumerate(trends):
-        ws.Cells(data_start_row + i, col).Value = trend
+
+    # 데이터 일괄 쓰기 — 2D 튜플로 Range.Value 에 한 번에 할당
+    data_2d = tuple((v,) for v in trends)
+    ws.Range(
+        ws.Cells(data_start_row, col),
+        ws.Cells(data_start_row + len(trends) - 1, col)
+    ).Value = data_2d
 
 
 # ══════════════════════════════════════════════
@@ -224,18 +218,12 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
     t_cfg = config["temp"]
     h_cfg = config["humid"]
 
-    log(f"포맷: [{fmt_key}] {fmt.get('description','')}")
+    log(f"포맷: [{fmt_key}] {fmt['description']}")
     log(f"헤더={header_row}행, 데이터 시작={data_start_row}행")
     log(f"온도='{temp_col_name}', 습도='{humid_col_name}'")
 
-    # 원본 → _trend 복사
-    base, ext = os.path.splitext(filepath)
-    out_path  = base + "_trend" + ext
-    shutil.copy2(filepath, out_path)
-    log(f"복사: {os.path.basename(out_path)}")
-
-    # 결과 파일 열기
-    xl, wb = _xl_open(out_path)
+    # 원본 파일 직접 열기 (복사 없음)
+    xl, wb = _xl_open(filepath)
     processed = []
 
     try:
@@ -282,15 +270,21 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if sheet_done:
                 processed.append(sheet_name)
 
+        # 저장 전 최적화 옵션 복원
+        xl.Calculation    = -4105   # xlCalculationAutomatic
+        xl.EnableEvents   = True
+        xl.ScreenUpdating = True
         wb.Save()
         xl.Visible = True
-        xl.ScreenUpdating = True
-        log(f"\n완료: {os.path.basename(out_path)}  ({len(processed)}개 시트)")
+        log(f"\n완료: {os.path.basename(filepath)}  ({len(processed)}개 시트)")
 
     except Exception as e:
+        xl.Calculation    = -4105
+        xl.EnableEvents   = True
+        xl.ScreenUpdating = True
         wb.Close(False); xl.Quit(); raise e
 
-    return out_path, processed
+    return filepath, processed
 
 
 # ══════════════════════════════════════════════
@@ -422,7 +416,12 @@ class App(tk.Tk):
         self.title("Trend Analyzer — Temperature & Humidity")
         self.configure(bg=self.BG)
         self.resizable(True, False)
-        self.config_data = load_config()
+        try:
+            self.config_data = load_config()
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            messagebox.showerror("설정 파일 오류", str(e))
+            self.destroy()
+            return
         self._sheet_rows: list[SheetRow] = []
         self._build_ui()
 
@@ -551,8 +550,8 @@ class App(tk.Tk):
         cols = fmt.get("columns", {})
         col_str = "  |  ".join(f"{k}='{v}'" for k, v in cols.items() if v)
         self.fmt_info_var.set(
-            f"  헤더={fmt.get('header_row',1)}행  "
-            f"데이터 시작={fmt.get('data_start_row',2)}행\n"
+            f"  헤더={fmt['header_row']}행  "
+            f"데이터 시작={fmt['data_start_row']}행\n"
             f"  {col_str}")
 
     def _edit_fmt(self):
@@ -625,11 +624,11 @@ class App(tk.Tk):
             self._log(msg); self.update_idletasks()
 
         try:
-            out_path, done = process_all_sheets(
+            _, done = process_all_sheets(
                 filepath, sheet_cfg_map, cfg, status_cb=status)
             messagebox.showinfo(
                 "완료",
-                f"분석 완료!\n처리 시트: {len(done)}개\n저장: {os.path.basename(out_path)}")
+                f"분석 완료!\n처리 시트: {len(done)}개\n저장: {os.path.basename(filepath)}")
         except Exception as e:
             self._log(f"[오류] {e}"); messagebox.showerror("오류", str(e))
 
