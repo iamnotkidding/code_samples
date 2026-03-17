@@ -44,27 +44,32 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
     """
     UP/DOWN 추세 분석.
 
+    구간 방향 결정 원칙:
+      - 연속으로 같은 방향(상승/하강)인 행의 묶음을 구간으로 추출
+      - 구간의 방향은 구간 내 첫값 vs 마지막값 비교로 확정
+        (중간 노이즈에 의한 방향 오판 방지)
+
     노이즈 조건:
       1) 값이 min_val 이하인 구간 전체
-      2) UP/DOWN 길이 < min_rows
-      3) flat(동일값) 길이 >= min_rows → BARRIER (해당 구간 "", 앞뒤 전파 차단)
+      2) 구간 길이 < min_rows
+      3) flat(동일값) 길이 >= min_rows → BARRIER (앞뒤 전파 차단, 빈값)
 
-    flat 구간(noise 포함) 처리 원칙:
-      - flat은 방향이 없으므로 앞 방향을 계승하지 않음
-      - 뒤에 유효한 UP/DOWN 구간이 있으면 그 방향을 따름
-      - 뒤에도 없고 앞에도 없으면 ""
+    flat 구간(noise) 처리:
+      - 뒤에 유효 UP/DOWN 있으면 그 방향 따름
+      - 없으면 앞 방향 따름
+      - BARRIER는 항상 ""
     """
     n = len(values)
     if n == 0:
         return []
 
-    # Step1: 인접 비교 → UP / DOWN / "" (flat)
+    # ── Step1: 인접 비교로 raw 방향 (UP/DOWN/"")
     raw = [""] * n
     for i in range(1, n):
         if   values[i] > values[i - 1]: raw[i] = "UP"
         elif values[i] < values[i - 1]: raw[i] = "DOWN"
 
-    # Step2: 연속 구간 추출
+    # ── Step2: 연속 구간 추출
     segments, i = [], 0
     while i < n:
         d = raw[i]; j = i
@@ -74,45 +79,47 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
 
     low_set = {k for k, v in enumerate(values) if v <= min_val}
 
-    def seg_len(si): return segments[si][1] - segments[si][0] + 1
-    def seg_dir(si): return segments[si][2]
+    def seg_len(si):  return segments[si][1] - segments[si][0] + 1
+    def seg_dir(si):  return segments[si][2]
+    def seg_start(si): return segments[si][0]
+    def seg_end(si):   return segments[si][1]
 
     def is_low(si):
         s, e, _ = segments[si]
         return all(k in low_set for k in range(s, e + 1))
 
     def is_flat_barrier(si):
-        """동일값 구간이 min_rows 이상 → 방향 전파 차단"""
         return seg_dir(si) == "" and seg_len(si) >= min_rows
 
+    def true_direction(si):
+        """
+        구간의 실제 방향을 첫값 vs 끝값으로 재확인.
+        중간 노이즈로 인한 오판 방지.
+        """
+        s, e = seg_start(si), seg_end(si)
+        if values[e] > values[s]: return "UP"
+        if values[e] < values[s]: return "DOWN"
+        return ""  # flat
+
     def is_valid(si):
-        """유효한 UP/DOWN 구간 (노이즈 아님, min_val 아님)"""
-        d = seg_dir(si)
-        return d in ("UP", "DOWN") and not is_low(si) and seg_len(si) >= min_rows
+        """유효 구간: min_val 아님, 길이 >= min_rows, 실제 방향 있음"""
+        if is_low(si): return False
+        if seg_len(si) < min_rows: return False
+        if seg_dir(si) == "": return False  # flat barrier or flat noise
+        return True
 
-    def is_flat_noise(si):
-        """flat 이지만 barrier 아닌 짧은 구간"""
-        return seg_dir(si) == "" and not is_flat_barrier(si)
-
-    def is_short_noise(si):
-        """UP/DOWN 이지만 너무 짧거나 min_val 이하"""
-        return not is_valid(si) and not is_flat_barrier(si) and not is_flat_noise(si)
-
-    # Step3: 각 구간 분류
-    #   BARRIER   : flat >= min_rows  → "" 확정, 전파 차단
-    #   VALID     : 유효 UP/DOWN      → 방향 확정
-    #   NOISE     : 짧은 UP/DOWN, low → 인접 채움
-    #   FLAT_NOISE: 짧은 flat         → 뒤 방향 우선, 없으면 앞
-
+    # ── Step3: 확정 방향 결정
     BARRIER = "__BARRIER__"
     resolved = [None] * S
     for si in range(S):
-        if is_flat_barrier(si):  resolved[si] = BARRIER
-        elif is_valid(si):       resolved[si] = seg_dir(si)
-        # else: None — 나중에 채움
+        if is_flat_barrier(si):
+            resolved[si] = BARRIER
+        elif is_valid(si):
+            # 첫값↔끝값 비교로 방향 재확정 (노이즈 방향 오판 방지)
+            d = true_direction(si)
+            resolved[si] = d if d in ("UP", "DOWN") else None
 
-    # Step4: 뒤→앞 전파 (flat_noise는 뒤 방향 우선)
-    #   barrier를 만나면 역방향 초기화
+    # ── Step4: 뒤→앞 전파 (noise/flat_noise → 뒤 유효 방향)
     nxt = ""
     for si in range(S - 1, -1, -1):
         if resolved[si] == BARRIER:
@@ -120,11 +127,9 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
         elif resolved[si] in ("UP", "DOWN"):
             nxt = resolved[si]
         elif resolved[si] is None:
-            # flat_noise 또는 short_noise: 뒤 방향으로 채움
-            resolved[si] = nxt
+            resolved[si] = nxt   # 뒤 방향으로 채움
 
-    # Step5: 앞→뒤 전파 (뒤에 방향이 없어서 "" 로 남은 구간 채움)
-    #   barrier를 만나면 전방향 초기화
+    # ── Step5: 앞→뒤 보완 (뒤에도 방향 없어 "" 로 남은 경우)
     last = ""
     for si in range(S):
         if resolved[si] == BARRIER:
@@ -132,16 +137,58 @@ def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
         elif resolved[si] in ("UP", "DOWN"):
             last = resolved[si]
         elif resolved[si] == "":
-            # 뒤→앞에서도 채워지지 않은 경우 (앞에 유효값이 있으면 계승)
-            resolved[si] = last
+            resolved[si] = last  # 앞 방향으로 채움
 
-    # Step6: 결과 배열
+    # ── Step6: 결과 배열
     result = [""] * n
     for si, (s, e, _) in enumerate(segments):
         val = "" if resolved[si] == BARRIER else (resolved[si] or "")
         for k in range(s, e + 1):
             result[k] = val
     return result
+
+
+
+# ══════════════════════════════════════════════
+# 포맷 자동 인식
+# ══════════════════════════════════════════════
+def detect_format(filepath: str, formats: dict) -> str:
+    """
+    첫 번째 시트의 헤더를 읽어 config formats 중 가장 일치하는 포맷 키를 반환.
+    모두 불일치하면 formats의 첫 번째 키를 반환.
+    """
+    xl = win32com.client.DispatchEx("Excel.Application")
+    xl.Visible = False; xl.DisplayAlerts = False; xl.ScreenUpdating = False
+    try:
+        wb = xl.Workbooks.Open(os.path.abspath(filepath), UpdateLinks=False, ReadOnly=True)
+        ws = wb.Sheets(1)
+        ur = ws.UsedRange
+        last_col = ur.Column + ur.Columns.Count - 1
+
+        best_key, best_score = None, -1
+        for fmt_key, fmt in formats.items():
+            header_row = int(fmt.get("header_row", 1))
+            col_map    = fmt.get("columns", {})
+            required   = {v.strip() for v in col_map.values() if v and v.strip()}
+            if not required:
+                continue
+            # 헤더 행 읽기
+            hdr_raw = ws.Range(
+                ws.Cells(header_row, 1),
+                ws.Cells(header_row, last_col)
+            ).Value
+            headers = set()
+            if hdr_raw:
+                for v in hdr_raw[0]:
+                    if v is not None: headers.add(str(v).strip())
+            score = len(required & headers)
+            if score > best_score:
+                best_score, best_key = score, fmt_key
+
+        wb.Close(False)
+        return best_key if best_key else next(iter(formats))
+    finally:
+        xl.Quit()
 
 # ══════════════════════════════════════════════
 # WIN32 헬퍼
@@ -264,18 +311,19 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
     def log(msg):
         if status_cb: status_cb(msg)
 
-    fmt_key        = config.get("input_format", "format1")
+    # 포맷 자동 인식
+    fmt_key = detect_format(filepath, config["formats"])
     fmt            = config["formats"][fmt_key]
-    header_row     = int(fmt.get("header_row", 1))
-    data_start_row = int(fmt.get("data_start_row", 2))
-    col_map        = fmt.get("columns", {})
+    header_row     = int(fmt["header_row"])
+    data_start_row = int(fmt["data_start_row"])
+    col_map        = fmt["columns"]
     temp_col_name  = col_map.get("temp",  "")
     humid_col_name = col_map.get("humid", "")
 
     t_cfg = config["temp"]
     h_cfg = config["humid"]
 
-    log(f"포맷: [{fmt_key}] {fmt['description']}")
+    log(f"포맷 자동 인식: [{fmt_key}] {fmt.get('description','')}")
     log(f"헤더={header_row}행, 데이터 시작={data_start_row}행")
     log(f"온도='{temp_col_name}', 습도='{humid_col_name}'")
 
@@ -504,26 +552,18 @@ class App(tk.Tk):
 
         fo = tk.Frame(self, bg=self.BG); fo.pack(fill="x", padx=P, pady=4)
 
-        fsel = tk.Frame(fo, bg=self.BG); fsel.pack(fill="x")
-        tk.Label(fsel, text="사용 포맷", font=self.LF,
+        tk.Label(fo, text="파일 선택 시 헤더를 읽어 포맷을 자동 인식합니다.",
+                 font=("Consolas", 9), bg=self.BG, fg="#A6ADC8").pack(anchor="w")
+
+        fsel = tk.Frame(fo, bg=self.BG); fsel.pack(fill="x", pady=(4,0))
+        self.fmt_info_var = tk.StringVar(value="(파일 미선택)")
+        tk.Label(fsel, text="인식 포맷", font=self.LF,
                  bg=self.BG, fg=self.FG, width=10, anchor="e").pack(side="left")
-        self.fmt_var = tk.StringVar(
-            value=self.config_data.get("input_format", "format1"))
-        self.fmt_cb = ttk.Combobox(fsel, textvariable=self.fmt_var,
-                                   width=12, state="readonly")
-        self.fmt_cb.pack(side="left", padx=6)
-        self.fmt_cb.bind("<<ComboboxSelected>>", lambda _: self._refresh_fmt_info())
+        tk.Label(fsel, textvariable=self.fmt_info_var,
+                 font=("Consolas", 9), bg=self.BG, fg="#89DCEB").pack(side="left", padx=6)
         tk.Button(fsel, text="편집", bg="#CBA6F7", fg=self.BFG,
                   font=self.LF, relief="flat", cursor="hand2",
                   command=self._edit_fmt).pack(side="left", padx=4)
-
-        self.fmt_info_var = tk.StringVar()
-        tk.Label(fo, textvariable=self.fmt_info_var,
-                 font=("Consolas", 9), bg=self.BG, fg="#A6ADC8",
-                 justify="left", anchor="w").pack(fill="x", pady=(4, 0))
-
-        self._refresh_fmt_combo()
-        self._refresh_fmt_info()
 
         self._sep()
 
@@ -590,30 +630,37 @@ class App(tk.Tk):
     def _sep(self):
         tk.Frame(self, bg=self.SEP, height=1).pack(fill="x", padx=self.PAD, pady=6)
 
-    def _refresh_fmt_combo(self):
-        keys = list(self.config_data["formats"].keys())
-        self.fmt_cb["values"] = keys
-        if self.fmt_var.get() not in keys and keys:
-            self.fmt_var.set(keys[0])
-
-    def _refresh_fmt_info(self):
-        key = self.fmt_var.get()
-        fmt = self.config_data["formats"].get(key, {})
-        cols = fmt.get("columns", {})
-        col_str = "  |  ".join(f"{k}='{v}'" for k, v in cols.items() if v)
-        self.fmt_info_var.set(
-            f"  헤더={fmt['header_row']}행  "
-            f"데이터 시작={fmt['data_start_row']}행\n"
-            f"  {col_str}")
-
     def _edit_fmt(self):
-        key = self.fmt_var.get()
+        keys = list(self.config_data["formats"].keys())
+        if not keys:
+            messagebox.showinfo("알림", "config.json에 formats가 없습니다."); return
+        # 현재 인식된 포맷을 기본 선택
+        cur = getattr(self, "_detected_fmt", keys[0])
+        if cur not in keys: cur = keys[0]
+        # 포맷 선택 다이얼로그
+        dlg_sel = tk.Toplevel(self)
+        dlg_sel.title("편집할 포맷 선택"); dlg_sel.configure(bg=self.BG)
+        dlg_sel.resizable(False, False)
+        tk.Label(dlg_sel, text="편집할 포맷", font=self.LF,
+                 bg=self.BG, fg=self.FG).pack(padx=12, pady=(12,4))
+        sel_var = tk.StringVar(value=cur)
+        cb = ttk.Combobox(dlg_sel, textvariable=sel_var, values=keys,
+                          width=16, state="readonly")
+        cb.pack(padx=12, pady=4)
+        chosen = [None]
+        def on_ok():
+            chosen[0] = sel_var.get(); dlg_sel.destroy()
+        tk.Button(dlg_sel, text="선택", bg=self.BBG, fg=self.BFG,
+                  font=self.LF, relief="flat", cursor="hand2",
+                  command=on_ok).pack(pady=(4,12), ipadx=10)
+        dlg_sel.grab_set(); dlg_sel.wait_window()
+        if not chosen[0]: return
+        key = chosen[0]
         dlg = FormatEditorDialog(self, key,
                                  self.config_data["formats"].get(key, {}),
                                  self.BG, self.FG, self.EBG, self.LF)
         if dlg.result:
             self.config_data["formats"][key] = dlg.result
-            self._refresh_fmt_info()
             self._log(f"포맷 [{key}] 수정됨")
 
     def _browse(self):
@@ -637,11 +684,24 @@ class App(tk.Tk):
             sr = SheetRow(self.sf, sname, self.BG, self.FG, self.LF, i)
             self._sheet_rows.append(sr)
         self._log(f"로드 완료: {len(names)}개 시트 — " + ", ".join(names))
+        # 포맷 자동 인식 결과 표시
+        try:
+            detected = detect_format(path, self.config_data["formats"])
+            fmt = self.config_data["formats"][detected]
+            col_map = fmt.get("columns", {})
+            col_str = "  ".join(f"{k}={v!r}" for k, v in col_map.items() if v)
+            self.fmt_info_var.set(
+                f"[{detected}]  헤더={fmt['header_row']}행  "
+                f"데이터={fmt['data_start_row']}행  {col_str}")
+            self._detected_fmt = detected
+            self._log(f"포맷 자동 인식: [{detected}] {fmt.get('description','')}")
+        except Exception as e:
+            self.fmt_info_var.set("(인식 실패)")
+            self._log(f"포맷 인식 실패: {e}")
 
     def _save_cfg(self):
         try:
             cfg = self.config_data.copy()
-            cfg["input_format"] = self.fmt_var.get()
             cfg["temp"]  = self.temp_cfg.get()
             cfg["humid"] = self.humid_cfg.get()
             save_config(cfg)
@@ -661,7 +721,6 @@ class App(tk.Tk):
             messagebox.showerror("오류", "시트 정보가 없습니다. 파일을 다시 선택하세요."); return
         try:
             cfg = self.config_data.copy()
-            cfg["input_format"] = self.fmt_var.get()
             cfg["temp"]  = self.temp_cfg.get()
             cfg["humid"] = self.humid_cfg.get()
         except ValueError:
