@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import threading
+from datetime import datetime, timedelta
 import win32com.client
 
 
@@ -273,14 +274,52 @@ def get_sheet_names(filepath: str) -> list:
         wb.Close(False); xl.Quit()
 
 
+def _parse_excel_dt(date_val, time_val):
+    """
+    Excel COM에서 읽은 날짜/시간 값을 datetime으로 변환.
+    - date_val, time_val 이 모두 있으면 합산
+    - 하나만 있으면 그것만 사용
+    - Excel serial number(float) 또는 Python datetime/str 처리
+    """
+    def to_dt(v):
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, float) or isinstance(v, int):
+            # Excel serial number → datetime (1900.1.1 기준)
+            try:
+                base = datetime(1899, 12, 30)
+                return base + timedelta(days=float(v))
+            except Exception:
+                return None
+        if isinstance(v, str):
+            for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                        "%Y/%m/%d", "%Y-%m-%d",
+                        "%H:%M:%S", "%H:%M"):
+                try: return datetime.strptime(v.strip(), fmt)
+                except ValueError: pass
+        return None
+
+    dt_date = to_dt(date_val)
+    dt_time = to_dt(time_val)
+
+    if dt_date and dt_time:
+        # date 부분 + time 부분 합산
+        return datetime(dt_date.year, dt_date.month, dt_date.day,
+                        dt_time.hour, dt_time.minute, dt_time.second,
+                        dt_time.microsecond)
+    return dt_date or dt_time
+
+
 def read_sheet(filepath: str, sheet_name: str,
                header_row: int, data_start_row: int,
-               temp_col_name: str, humid_col_name: str):
+               temp_col_name: str, humid_col_name: str,
+               date_col_name: str = "", time_col_name: str = ""):
     """
     win32com으로 시트 읽기 (대용량 최적화).
-    - 헤더: Range 1행 일괄 읽기
-    - 데이터: 컬럼 단위 Range.Value 일괄 읽기 (셀 루프 없음)
-    반환: (temp_vals: list[float], humid_vals: list[float])
+    반환: (temp_vals, humid_vals, timestamps)
+      timestamps: list[datetime | None]  — 행별 타임스탬프
     """
     xl, wb = _xl_open(filepath)
     try:
@@ -290,26 +329,18 @@ def read_sheet(filepath: str, sheet_name: str,
         last_row = ur.Row    + ur.Rows.Count    - 1
 
         # 헤더 행 일괄 읽기
-        hdr_range = ws.Range(
+        hdr_raw = ws.Range(
             ws.Cells(header_row, 1),
             ws.Cells(header_row, last_col)
-        )
-        hdr_raw = hdr_range.Value  # tuple of tuples (1 row)
+        ).Value
         headers = [
             str(v).strip() if v is not None else ""
             for v in (hdr_raw[0] if hdr_raw else [])
         ]
 
         def col_of(name: str) -> int:
-            """
-            config 값이 "" → 헤더가 빈 문자열인 첫 번째 열만 매치
-            config 값이 있음 → 부분 문자열 포함 매칭 (대소문자 무시)
-                              단, 헤더가 빈 문자열인 셀은 제외
-            찾지 못하면 -1 반환
-            """
             name_stripped = name.strip()
             if name_stripped == "":
-                # config "" → 빈 헤더 셀만 매치
                 for i, h in enumerate(headers):
                     if h.strip() == "":
                         return i + 1
@@ -317,34 +348,121 @@ def read_sheet(filepath: str, sheet_name: str,
             name_low = name_stripped.lower()
             for i, h in enumerate(headers):
                 if h.strip() == "":
-                    continue   # 빈 헤더는 config가 ""일 때만 매치
+                    continue
                 hl = h.lower()
                 if name_low in hl or hl in name_low:
                     return i + 1
             return -1
 
-        t_ci = col_of(temp_col_name)
-        h_ci = col_of(humid_col_name)
+        t_ci    = col_of(temp_col_name)
+        h_ci    = col_of(humid_col_name)
+        date_ci = col_of(date_col_name)
+        time_ci = col_of(time_col_name)
 
-        def read_col(ci: int) -> list:
-            """컬럼 전체를 Range.Value 단일 호출로 일괄 읽기"""
-            if ci < 1:
-                return []
-            col_range = ws.Range(
-                ws.Cells(data_start_row, ci),
-                ws.Cells(last_row, ci)
-            )
-            raw = col_range.Value  # tuple of 1-element tuples
+        def read_col_float(ci: int) -> list:
+            if ci < 1: return []
+            raw = ws.Range(ws.Cells(data_start_row, ci),
+                           ws.Cells(last_row, ci)).Value or []
             out = []
-            for row_tuple in (raw or []):
+            for row_tuple in raw:
                 v = row_tuple[0] if isinstance(row_tuple, tuple) else row_tuple
                 try:    out.append(float(v) if v is not None else 0.0)
                 except: out.append(0.0)
             return out
 
-        return read_col(t_ci), read_col(h_ci)
+        def read_col_raw(ci: int) -> list:
+            """원본 값 그대로 반환 (datetime/float/str 혼용)"""
+            if ci < 1: return []
+            raw = ws.Range(ws.Cells(data_start_row, ci),
+                           ws.Cells(last_row, ci)).Value or []
+            return [r[0] if isinstance(r, tuple) else r for r in raw]
+
+        temp_vals  = read_col_float(t_ci)
+        humid_vals = read_col_float(h_ci)
+
+        # 타임스탬프 구성
+        n = max(len(temp_vals), len(humid_vals))
+        if date_ci > 0 and time_ci > 0:
+            # Date + Time 컬럼 분리된 경우 합산
+            dates = read_col_raw(date_ci)
+            times = read_col_raw(time_ci)
+            timestamps = [
+                _parse_excel_dt(dates[i] if i < len(dates) else None,
+                                times[i] if i < len(times) else None)
+                for i in range(n)
+            ]
+        elif time_ci > 0:
+            times = read_col_raw(time_ci)
+            timestamps = [
+                _parse_excel_dt(None, times[i] if i < len(times) else None)
+                for i in range(n)
+            ]
+        elif date_ci > 0:
+            dates = read_col_raw(date_ci)
+            timestamps = [
+                _parse_excel_dt(dates[i] if i < len(dates) else None, None)
+                for i in range(n)
+            ]
+        else:
+            timestamps = [None] * n
+
+        return temp_vals, humid_vals, timestamps
     finally:
         wb.Close(False); xl.Quit()
+
+
+
+def calc_rate_per_min(values: list, timestamps: list, trends: list) -> list:
+    """
+    각 그룹(연속 UP/DOWN 구간)의 분당 변화량을 계산.
+    - 그룹 내 첫 행과 마지막 행의 값/시간 차이로 계산
+    - 시간 정보가 없으면 행 번호(인덱스) 기준으로 계산
+    - 유효하지 않은 행("")은 빈 문자열 반환
+    반환: list[float | ""]  — 각 행의 분당 변화량 (그룹 내 모든 행에 동일값)
+    """
+    n = len(values)
+    if n == 0:
+        return []
+
+    # 연속 구간 추출
+    segments = []
+    i = 0
+    while i < n:
+        d = trends[i]; j = i
+        while j < n and trends[j] == d:
+            j += 1
+        segments.append((i, j - 1, d))
+        i = j
+
+    result = [""] * n
+
+    for s, e, d in segments:
+        if d not in ("UP", "DOWN"):
+            continue
+
+        v_start = values[s]
+        v_end   = values[e]
+        dv      = v_end - v_start
+
+        # 시간 차이 계산 (분 단위)
+        ts_start = timestamps[s] if timestamps and s < len(timestamps) else None
+        ts_end   = timestamps[e] if timestamps and e < len(timestamps) else None
+
+        if ts_start and ts_end and ts_start != ts_end:
+            dt_minutes = (ts_end - ts_start).total_seconds() / 60.0
+        else:
+            # 시간 정보 없음 → 행 개수를 분으로 간주
+            dt_minutes = float(e - s) if e > s else 1.0
+
+        if dt_minutes == 0:
+            rate = 0.0
+        else:
+            rate = round(dv / dt_minutes, 4)
+
+        for k in range(s, e + 1):
+            result[k] = rate
+
+    return result
 
 
 def write_trend_col(ws, header_row: int, data_start_row: int,
@@ -415,6 +533,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
     col_map        = fmt["columns"]
     temp_col_name  = col_map.get("temp",  "")
     humid_col_name = col_map.get("humid", "")
+    date_col_name  = col_map.get("date",  "")
+    time_col_name  = col_map.get("time",  "")
 
     t_cfg = config["temp"]
     h_cfg = config["humid"]
@@ -434,10 +554,11 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             log(f"  [{sheet_name}] 읽는 중...")
             try:
-                temp_vals, humid_vals = read_sheet(
+                temp_vals, humid_vals, timestamps = read_sheet(
                     filepath, sheet_name,
                     header_row, data_start_row,
-                    temp_col_name, humid_col_name)
+                    temp_col_name, humid_col_name,
+                    date_col_name, time_col_name)
             except Exception as e:
                 log(f"  [{sheet_name}] 읽기 실패: {e}"); continue
 
@@ -451,6 +572,9 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                         int(t_cfg["fill_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Temp_Trend", trends)
+                rates = calc_rate_per_min(temp_vals, timestamps, trends)
+                write_trend_col(ws, header_row, data_start_row,
+                                "Temp_Rate", rates)
                 _t_up   = count_groups(trends, 'UP')
                 _t_down = count_groups(trends, 'DOWN')
                 log(f"  [{sheet_name}] 🌡 온도  UP그룹={_t_up}, DOWN그룹={_t_down}")
@@ -464,6 +588,9 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                         int(h_cfg["fill_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Humid_Trend", trends)
+                rates = calc_rate_per_min(humid_vals, timestamps, trends)
+                write_trend_col(ws, header_row, data_start_row,
+                                "Humid_Rate", rates)
                 _h_up   = count_groups(trends, 'UP')
                 _h_down = count_groups(trends, 'DOWN')
                 log(f"  [{sheet_name}] 💧 습도  UP그룹={_h_up}, DOWN그룹={_h_down}")
