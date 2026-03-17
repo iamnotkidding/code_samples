@@ -41,7 +41,7 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
-def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
+def analyze_trends(values: list, min_rows: int, fill_rows: int) -> list:
     """
     UP/DOWN 추세 분석 (4단계).
 
@@ -51,10 +51,10 @@ def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
            values[i] == values[i-1] → "" (flat)
            index 0 은 항상 ""
 
-    Step2: UP 구간 사이에 flat이 cont_rows 이하면 UP으로 채움
-           (UP ... flat×N ... UP  →  N <= cont_rows 이면 flat을 UP으로)
+    Step2: UP 구간 사이에 flat이 fill_rows 이하면 UP으로 채움
+           (UP ... flat×N ... UP  →  N <= fill_rows 이면 flat을 UP으로)
 
-    Step3: DOWN 구간 사이에 flat이 cont_rows 이하면 DOWN으로 채움
+    Step3: DOWN 구간 사이에 flat이 fill_rows 이하면 DOWN으로 채움
 
     Step4: 연속 UP/DOWN 길이가 min_rows 미만이면 "" (ignore)
     """
@@ -72,7 +72,7 @@ def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
     def fill_flat_between(direction: str, data: list) -> list:
         """
         같은 direction 구간 사이에 끼인 flat("") 구간이
-        cont_rows 이하면 해당 방향으로 채움.
+        fill_rows 이하면 해당 방향으로 채움.
         """
         result = data[:]
         i = 0
@@ -89,8 +89,8 @@ def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
             while k < n and result[k] == "":
                 k += 1
             flat_len = k - j
-            # flat 뒤가 같은 direction 이고 flat 길이 <= cont_rows 이면 채움
-            if k < n and result[k] == direction and flat_len <= cont_rows:
+            # flat 뒤가 같은 direction 이고 flat 길이 <= fill_rows 이면 채움
+            if k < n and result[k] == direction and flat_len <= fill_rows:
                 for idx in range(j, k):
                     result[idx] = direction
                 i = k  # 채운 구간 이후부터 재탐색
@@ -123,6 +123,20 @@ def analyze_trends(values: list, min_rows: int, cont_rows: int) -> list:
 
     return result
 
+
+
+def count_groups(trends: list, direction: str) -> int:
+    """연속된 direction 구간(그룹)의 개수를 반환"""
+    count = 0
+    in_group = False
+    for v in trends:
+        if v == direction:
+            if not in_group:
+                count += 1
+                in_group = True
+        else:
+            in_group = False
+    return count
 
 # ══════════════════════════════════════════════
 # 포맷 자동 인식
@@ -343,12 +357,12 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if temp_vals:
                 trends = analyze_trends(temp_vals,
                                         int(t_cfg["min_rows"]),
-                                        int(t_cfg["cont_rows"]))
+                                        int(t_cfg["fill_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Temp_Trend", trends)
-                _t_up   = trends.count('UP')
-                _t_down = trends.count('DOWN')
-                log(f"  [{sheet_name}] 🌡 온도  UP={_t_up}, DOWN={_t_down}")
+                _t_up   = count_groups(trends, 'UP')
+                _t_down = count_groups(trends, 'DOWN')
+                log(f"  [{sheet_name}] 🌡 온도  UP그룹={_t_up}, DOWN그룹={_t_down}")
                 sheet_done = True
             else:
                 log(f"  [{sheet_name}] 🌡 온도 컬럼 없음")
@@ -356,12 +370,12 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if humid_vals:
                 trends = analyze_trends(humid_vals,
                                         int(h_cfg["min_rows"]),
-                                        int(h_cfg["cont_rows"]))
+                                        int(h_cfg["fill_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Humid_Trend", trends)
-                _h_up   = trends.count('UP')
-                _h_down = trends.count('DOWN')
-                log(f"  [{sheet_name}] 💧 습도  UP={_h_up}, DOWN={_h_down}")
+                _h_up   = count_groups(trends, 'UP')
+                _h_down = count_groups(trends, 'DOWN')
+                log(f"  [{sheet_name}] 💧 습도  UP그룹={_h_up}, DOWN그룹={_h_down}")
                 sheet_done = True
             else:
                 log(f"  [{sheet_name}] 💧 습도 컬럼 없음")
@@ -464,10 +478,10 @@ class SensorConfigFrame(tk.LabelFrame):
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
         self.min_rows_var  = tk.StringVar(value=str(init.get("min_rows",  3)))
-        self.cont_rows_var = tk.StringVar(value=str(init.get("cont_rows", 1)))
+        self.fill_rows_var = tk.StringVar(value=str(init.get("fill_rows", 1)))
         for i, (lbl, var) in enumerate([
             ("min_rows  (UP/DOWN 최소 연속 행)", self.min_rows_var),
-            ("cont_rows (flat 허용 연속 행)",    self.cont_rows_var),
+            ("fill_rows (flat 허용 연속 행)",    self.fill_rows_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
@@ -477,7 +491,7 @@ class SensorConfigFrame(tk.LabelFrame):
 
     def get(self):
         return {"min_rows":  int(self.min_rows_var.get()),
-                "cont_rows": int(self.cont_rows_var.get())}
+                "fill_rows": int(self.fill_rows_var.get())}
 
 
 # ══════════════════════════════════════════════
@@ -500,7 +514,7 @@ class SheetRow:
 
     def set_result(self, t_up, t_down, h_up, h_down):
         self._result_var.set(
-            f"🌡UP={t_up} DN={t_down}  💧UP={h_up} DN={h_down}")
+            f"🌡UP그룹={t_up} DN그룹={t_down}  💧UP그룹={h_up} DN그룹={h_down}")
 
     def clear_result(self):
         self._result_var.set("")
@@ -716,8 +730,8 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, cont_rows={cfg['temp']['cont_rows']}\n"
-                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, cont_rows={cfg['humid']['cont_rows']}")
+                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, fill_rows={cfg['temp']['fill_rows']}\n"
+                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, fill_rows={cfg['humid']['fill_rows']}")
         except ValueError:
             messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
