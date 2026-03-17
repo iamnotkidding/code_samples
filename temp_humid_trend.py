@@ -518,6 +518,9 @@ class SheetRow:
     def set_result(self, t_up, t_down, h_up, h_down):
         self._result_var.set(
             f"🌡UP그룹={t_up} DN그룹={t_down}  💧UP그룹={h_up} DN그룹={h_down}")
+        # UP 또는 DOWN 이 1개 이상이면 파란색, 모두 0이면 기본색
+        has_result = (t_up + t_down + h_up + h_down) > 0
+        self._result_lbl.configure(fg="#89B4FA" if has_result else "#585B70")
 
     def clear_result(self):
         self._result_var.set("")
@@ -605,8 +608,8 @@ class App(tk.Tk):
                      bg="#313244", fg="#A6ADC8",
                      padx=4, pady=2)
             if w: lbl.configure(width=w)
-            lbl.grid(row=0, column=col, padx=2, pady=(0,2),
-                     sticky="ew" if col == 2 else "w")
+            # 분석 결과 헤더는 내용 크기에 맞추되 남는 공간 채움
+            lbl.grid(row=0, column=col, padx=2, pady=(0,2), sticky="w")
         hf.columnconfigure(2, weight=1)
 
         self.canvas = tk.Canvas(self, bg=self.BG, highlightthickness=0, height=130)
