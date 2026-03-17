@@ -4,7 +4,7 @@ Excel Trend Analyzer — Temperature & Humidity
 - 셀 색깔 / 폰트 / 정렬 없음 — 값만 기록
 - 3가지 입력 포맷 지원 (config.json)
 - 전체 시트 각각 독립 처리
-- 온도 / 습도 각각 독립 min_rows, min_val
+- 온도 / 습도 각각 독립 min_rows
 - 결과: 입력 파일에 직접 Temp_Trend / Humid_Trend 컬럼 추가 후 저장
 """
 
@@ -40,155 +40,50 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
-def analyze_trends(values: list, min_rows: int, min_val: float) -> list:
+def analyze_trends(values: list, min_rows: int) -> list:
     """
     UP/DOWN 추세 분석.
 
-    구간 방향 결정 원칙:
-      - 연속으로 같은 방향(상승/하강)인 행의 묶음을 구간으로 추출
-      - 구간의 방향은 구간 내 첫값 vs 마지막값 비교로 확정
-        (중간 노이즈에 의한 방향 오판 방지)
+    규칙:
+      1. 이전 값보다 크면 UP, 작으면 DOWN (동일값은 방향 없음)
+      2. 같은 방향이 연속으로 min_rows 개 이상인 구간만 유효
+      3. 유효하지 않은 구간(짧거나 flat)은 빈칸("")
+      4. min_val 기준 없음
 
-    노이즈 조건:
-      1) 값이 min_val 이하인 구간 전체
-      2) 구간 길이 < min_rows
-      3) flat(동일값) 길이 >= min_rows → BARRIER (앞뒤 전파 차단, 빈값)
-
-    flat 구간(noise) 처리:
-      - 뒤에 유효 UP/DOWN 있으면 그 방향 따름
-      - 없으면 앞 방향 따름
-      - BARRIER는 항상 ""
+    첫 번째 행은 이전 값이 없으므로 다음 행과 같은 방향으로 처리.
     """
     n = len(values)
     if n == 0:
         return []
 
-    # ── Step1: 인접 비교로 raw 방향 (UP/DOWN/"")
+    # Step1: 인접 비교 → UP / DOWN / "" (flat)
+    # index 0은 index 1과 같은 방향으로 채움 (이전 값 없음)
     raw = [""] * n
     for i in range(1, n):
         if   values[i] > values[i - 1]: raw[i] = "UP"
         elif values[i] < values[i - 1]: raw[i] = "DOWN"
+    if n >= 2:
+        raw[0] = raw[1]   # 첫 행 = 두 번째 행 방향
 
-    # ── Step2: 연속 구간 추출
-    segments, i = [], 0
+    # Step2: 연속 구간 추출
+    segments = []
+    i = 0
     while i < n:
         d = raw[i]; j = i
-        while j < n and raw[j] == d: j += 1
-        segments.append((i, j - 1, d)); i = j
-    S = len(segments)
+        while j < n and raw[j] == d:
+            j += 1
+        segments.append((i, j - 1, d))
+        i = j
 
-    low_set = {k for k, v in enumerate(values) if v <= min_val}
-
-    def seg_len(si):  return segments[si][1] - segments[si][0] + 1
-    def seg_dir(si):  return segments[si][2]
-    def seg_start(si): return segments[si][0]
-    def seg_end(si):   return segments[si][1]
-
-    def is_low(si):
-        s, e, _ = segments[si]
-        return all(k in low_set for k in range(s, e + 1))
-
-    def is_flat_barrier(si):
-        return seg_dir(si) == "" and seg_len(si) >= min_rows
-
-    def true_direction(si):
-        """
-        구간의 실제 방향을 첫값 vs 끝값으로 재확인.
-        중간 노이즈로 인한 오판 방지.
-        """
-        s, e = seg_start(si), seg_end(si)
-        if values[e] > values[s]: return "UP"
-        if values[e] < values[s]: return "DOWN"
-        return ""  # flat
-
-    def is_valid(si):
-        """유효 구간: min_val 아님, 길이 >= min_rows, 실제 방향 있음"""
-        if is_low(si): return False
-        if seg_len(si) < min_rows: return False
-        if seg_dir(si) == "": return False  # flat barrier or flat noise
-        return True
-
-    # ── Step3: 확정 방향 결정
-    BARRIER = "__BARRIER__"
-    resolved = [None] * S
-    for si in range(S):
-        if is_flat_barrier(si):
-            resolved[si] = BARRIER
-        elif is_valid(si):
-            # 첫값↔끝값 비교로 방향 재확정 (노이즈 방향 오판 방지)
-            d = true_direction(si)
-            resolved[si] = d if d in ("UP", "DOWN") else None
-
-    # ── Step4: 뒤→앞 전파 (noise/flat_noise → 뒤 유효 방향)
-    nxt = ""
-    for si in range(S - 1, -1, -1):
-        if resolved[si] == BARRIER:
-            nxt = ""
-        elif resolved[si] in ("UP", "DOWN"):
-            nxt = resolved[si]
-        elif resolved[si] is None:
-            resolved[si] = nxt   # 뒤 방향으로 채움
-
-    # ── Step5: 앞→뒤 보완 (뒤에도 방향 없어 "" 로 남은 경우)
-    last = ""
-    for si in range(S):
-        if resolved[si] == BARRIER:
-            last = ""
-        elif resolved[si] in ("UP", "DOWN"):
-            last = resolved[si]
-        elif resolved[si] == "":
-            resolved[si] = last  # 앞 방향으로 채움
-
-    # ── Step6: 결과 배열
+    # Step3: min_rows 이상인 UP/DOWN 구간만 유효, 나머지 빈칸
     result = [""] * n
-    for si, (s, e, _) in enumerate(segments):
-        val = "" if resolved[si] == BARRIER else (resolved[si] or "")
-        for k in range(s, e + 1):
-            result[k] = val
+    for s, e, d in segments:
+        if d in ("UP", "DOWN") and (e - s + 1) >= min_rows:
+            for k in range(s, e + 1):
+                result[k] = d
+
     return result
 
-
-
-# ══════════════════════════════════════════════
-# 포맷 자동 인식
-# ══════════════════════════════════════════════
-def detect_format(filepath: str, formats: dict) -> str:
-    """
-    첫 번째 시트의 헤더를 읽어 config formats 중 가장 일치하는 포맷 키를 반환.
-    모두 불일치하면 formats의 첫 번째 키를 반환.
-    """
-    xl = win32com.client.DispatchEx("Excel.Application")
-    xl.Visible = False; xl.DisplayAlerts = False; xl.ScreenUpdating = False
-    try:
-        wb = xl.Workbooks.Open(os.path.abspath(filepath), UpdateLinks=False, ReadOnly=True)
-        ws = wb.Sheets(1)
-        ur = ws.UsedRange
-        last_col = ur.Column + ur.Columns.Count - 1
-
-        best_key, best_score = None, -1
-        for fmt_key, fmt in formats.items():
-            header_row = int(fmt.get("header_row", 1))
-            col_map    = fmt.get("columns", {})
-            required   = {v.strip() for v in col_map.values() if v and v.strip()}
-            if not required:
-                continue
-            # 헤더 행 읽기
-            hdr_raw = ws.Range(
-                ws.Cells(header_row, 1),
-                ws.Cells(header_row, last_col)
-            ).Value
-            headers = set()
-            if hdr_raw:
-                for v in hdr_raw[0]:
-                    if v is not None: headers.add(str(v).strip())
-            score = len(required & headers)
-            if score > best_score:
-                best_score, best_key = score, fmt_key
-
-        wb.Close(False)
-        return best_key if best_key else next(iter(formats))
-    finally:
-        xl.Quit()
 
 # ══════════════════════════════════════════════
 # WIN32 헬퍼
@@ -350,8 +245,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if temp_vals:
                 trends = analyze_trends(temp_vals,
-                                        int(t_cfg["min_rows"]),
-                                        float(t_cfg["min_val"]))
+                                        int(t_cfg["min_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Temp_Trend", trends)
                 log(f"  [{sheet_name}] 🌡 온도  "
@@ -362,8 +256,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if humid_vals:
                 trends = analyze_trends(humid_vals,
-                                        int(h_cfg["min_rows"]),
-                                        float(h_cfg["min_val"]))
+                                        int(h_cfg["min_rows"]))
                 write_trend_col(ws, header_row, data_start_row,
                                 "Humid_Trend", trends)
                 log(f"  [{sheet_name}] 💧 습도  "
@@ -468,20 +361,14 @@ class SensorConfigFrame(tk.LabelFrame):
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
         self.min_rows_var = tk.StringVar(value=str(init.get("min_rows", 3)))
-        self.min_val_var  = tk.StringVar(value=str(init.get("min_val",  0.0)))
-        for i, (lbl, var) in enumerate([
-            ("min_rows  (노이즈 최소 행)", self.min_rows_var),
-            ("min_val   (노이즈 임계값)",  self.min_val_var),
-        ]):
-            tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
-                row=i, column=0, sticky="e", padx=(0, 6), pady=3)
-            tk.Entry(self, textvariable=var, width=10,
-                     bg=ebg, fg=fg, insertbackground=fg,
-                     relief="flat").grid(row=i, column=1, sticky="w", pady=3)
+        tk.Label(self, text="min_rows  (최소 연속 행)", font=lf, bg=bg, fg=fg).grid(
+            row=0, column=0, sticky="e", padx=(0, 6), pady=3)
+        tk.Entry(self, textvariable=self.min_rows_var, width=10,
+                 bg=ebg, fg=fg, insertbackground=fg,
+                 relief="flat").grid(row=0, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"min_rows": int(self.min_rows_var.get()),
-                "min_val":  float(self.min_val_var.get())}
+        return {"min_rows": int(self.min_rows_var.get())}
 
 
 # ══════════════════════════════════════════════
@@ -707,11 +594,11 @@ class App(tk.Tk):
             save_config(cfg)
             self.config_data = cfg
             self._log(
-                f"설정 저장  포맷=[{cfg['input_format']}]\n"
-                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, min_val={cfg['temp']['min_val']}\n"
-                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, min_val={cfg['humid']['min_val']}")
+                f"설정 저장\n"
+                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}\n"
+                f"  💧 humid: min_rows={cfg['humid']['min_rows']}")
         except ValueError:
-            messagebox.showerror("오류", "min_rows는 정수, min_val은 실수로 입력하세요.")
+            messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
     def _run(self):
         filepath = self.file_var.get().strip()
@@ -724,7 +611,7 @@ class App(tk.Tk):
             cfg["temp"]  = self.temp_cfg.get()
             cfg["humid"] = self.humid_cfg.get()
         except ValueError:
-            messagebox.showerror("오류", "min_rows / min_val 값을 확인하세요."); return
+            messagebox.showerror("오류", "min_rows 값을 확인하세요."); return
 
         sheet_cfg_map = {sr.sheet_name: sr.get() for sr in self._sheet_rows}
 
