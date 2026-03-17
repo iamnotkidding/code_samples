@@ -505,12 +505,15 @@ class SheetRow:
 
         tk.Checkbutton(parent, variable=self.enabled, bg=bg, fg=fg,
                        selectcolor="#313244", activebackground=bg).grid(
-            row=row_idx, column=0, padx=(6, 2))
+            row=row_idx, column=0, padx=(6, 2), sticky="w")
         tk.Label(parent, text=sheet_name, font=lf, bg=bg, fg=fg,
-                 width=20, anchor="w").grid(row=row_idx, column=1, padx=4)
-        tk.Label(parent, textvariable=self._result_var,
+                 width=20, anchor="w").grid(row=row_idx, column=1, padx=4, sticky="w")
+        self._result_lbl = tk.Label(parent, textvariable=self._result_var,
                  font=("Consolas", 9), bg=bg, fg="#A6E3A1",
-                 width=30, anchor="w").grid(row=row_idx, column=2, padx=4)
+                 anchor="w")
+        self._result_lbl.grid(row=row_idx, column=2, padx=4, sticky="ew")
+        # 결과 컬럼(2)이 여분 공간을 모두 차지하도록
+        parent.columnconfigure(2, weight=1)
 
     def set_result(self, t_up, t_down, h_up, h_down):
         self._result_var.set(
@@ -538,6 +541,8 @@ class App(tk.Tk):
         self.title("Trend Analyzer — Temperature & Humidity")
         self.configure(bg=self.BG)
         self.resizable(True, False)
+        self.geometry("900x700")
+        self.minsize(700, 400)
         try:
             self.config_data = load_config()
         except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -595,10 +600,14 @@ class App(tk.Tk):
                  bg=self.BG, fg="#A6E3A1").pack(pady=(0, 2))
 
         hf = tk.Frame(self, bg=self.BG); hf.pack(fill="x", padx=P)
-        for col, txt, w in [(0,"적용",4),(1,"시트명",20),(2,"분석 결과",30)]:
-            tk.Label(hf, text=txt, font=("Segoe UI", 9, "bold"),
-                     bg="#313244", fg="#A6ADC8", width=w,
-                     padx=4, pady=2).grid(row=0, column=col, padx=2, pady=(0,2))
+        for col, txt, w in [(0,"적용",4),(1,"시트명",20),(2,"분석 결과",0)]:
+            lbl = tk.Label(hf, text=txt, font=("Segoe UI", 9, "bold"),
+                     bg="#313244", fg="#A6ADC8",
+                     padx=4, pady=2)
+            if w: lbl.configure(width=w)
+            lbl.grid(row=0, column=col, padx=2, pady=(0,2),
+                     sticky="ew" if col == 2 else "w")
+        hf.columnconfigure(2, weight=1)
 
         self.canvas = tk.Canvas(self, bg=self.BG, highlightthickness=0, height=130)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
@@ -608,10 +617,16 @@ class App(tk.Tk):
 
         self.sf = tk.Frame(self.canvas, bg=self.BG)
         self._cw = self.canvas.create_window((0, 0), window=self.sf, anchor="nw")
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        # 캔버스 자체 휠 바인딩
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>",   self._on_mousewheel)
+        self.canvas.bind("<Button-5>",   self._on_mousewheel)
+        # sf Configure: 스크롤 영역 갱신 + 하위 위젯 휠 바인딩
         self.sf.bind("<Configure>",
-                     lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfig(self._cw, width=e.width))
+                     lambda e: (self.canvas.configure(
+                         scrollregion=self.canvas.bbox("all")),
+                         self._bind_scroll(self.sf)))
         tk.Label(self.sf, text="← Excel 파일을 선택하면 시트 목록이 표시됩니다",
                  font=self.LF, bg=self.BG, fg="#585B70").grid(
             row=0, column=0, columnspan=2, pady=14)
@@ -648,6 +663,27 @@ class App(tk.Tk):
         self.log_box = tk.Text(self, height=8, bg="#181825", fg="#BAC2DE",
                                font=("Consolas", 9), relief="flat", state="disabled")
         self.log_box.pack(fill="x", padx=P, pady=(0, P))
+
+    def _on_canvas_resize(self, event):
+        self.canvas.itemconfig(self._cw, width=event.width)
+        self.sf.columnconfigure(2, weight=1)
+
+    def _on_mousewheel(self, event):
+        """Windows / macOS 공통 마우스 휠 스크롤"""
+        if event.num == 4:        # Linux scroll up
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:      # Linux scroll down
+            self.canvas.yview_scroll(1, "units")
+        else:                     # Windows / macOS
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _bind_scroll(self, widget):
+        """위젯과 그 하위 위젯에 마우스 휠 이벤트 바인딩"""
+        widget.bind("<MouseWheel>", self._on_mousewheel)   # Windows/macOS
+        widget.bind("<Button-4>",   self._on_mousewheel)   # Linux up
+        widget.bind("<Button-5>",   self._on_mousewheel)   # Linux down
+        for child in widget.winfo_children():
+            self._bind_scroll(child)
 
     def _sep(self):
         tk.Frame(self, bg=self.SEP, height=1).pack(fill="x", padx=self.PAD, pady=6)
