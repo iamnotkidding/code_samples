@@ -163,70 +163,79 @@ def detect_format(filepath: str, formats: dict) -> tuple:
         ur = ws.UsedRange
         last_col = ur.Column + ur.Columns.Count - 1
 
-        best_key, best_score, best_headers_raw = None, -1, []
+        # ── Step1: 포맷 점수 계산 ────────────────────────────────
+        # 각 포맷의 header_row 헤더를 읽어 config column 값과 매칭 점수 계산.
+        # 빈 문자열 config("") 도 점수에 포함 (빈 헤더 셀 존재 여부로 판단).
+        best_key, best_score = None, -1
+        fmt_headers = {}   # fmt_key → headers_orig (재사용)
 
         for fmt_key, fmt in formats.items():
             header_row = int(fmt.get("header_row", 1))
             col_map    = fmt.get("columns", {})
-            required   = [v.strip().lower() for v in col_map.values()
-                          if v and v.strip()]
-            if not required:
-                continue
+
             hdr_raw = ws.Range(
                 ws.Cells(header_row, 1),
                 ws.Cells(header_row, last_col)
             ).Value
-            # 원본 헤더(대소문자 보존) 와 소문자 버전 함께 보관
             headers_orig = []
-            headers_low  = []
             if hdr_raw:
-                for v in hdr_raw[0]:
-                    orig = str(v).strip() if v is not None else ""
-                    headers_orig.append(orig)
-                    headers_low.append(orig.lower())
+                row = hdr_raw[0] if isinstance(hdr_raw[0], tuple) else hdr_raw
+                for v in row:
+                    headers_orig.append(str(v).strip() if v is not None else "")
+            fmt_headers[fmt_key] = headers_orig
 
             score = 0
-            for req in required:
-                if any(req in h or h in req for h in headers_low if h):
-                    score += 1
+            for cfg_val in col_map.values():
+                if cfg_val is None:
+                    cfg_val = ""
+                cfg_name = cfg_val.strip().lower()
+
+                if cfg_name == "":
+                    # config "" → 헤더가 빈 셀 존재하면 +1
+                    if any(h == "" for h in headers_orig):
+                        score += 1
+                else:
+                    # config 값 있음 → 빈 헤더 제외하고 부분 문자열 매칭
+                    if any(cfg_name in h.lower() or h.lower() in cfg_name
+                           for h in headers_orig if h != ""):
+                        score += 1
 
             if score > best_score:
                 best_score, best_key = score, fmt_key
-                best_headers_raw = headers_orig
 
         wb.Close(False)
 
         if not best_key:
             best_key = next(iter(formats))
 
-        # 선택된 포맷의 temp/humid config 명으로 실제 헤더명 매칭
-        fmt     = formats[best_key]
-        col_map = fmt.get("columns", {})
-        matched = {}
-        for role in ("temp", "humid"):
-            cfg_val = col_map.get(role, "")
-            if cfg_val is None:
-                cfg_val = ""
-            cfg_name = cfg_val.strip().lower()
+        # ── Step2: 선택된 포맷으로 실제 컬럼 이름 매칭 ──────────
+        # Step1과 동일한 규칙으로 temp/humid 실제 헤더명 반환.
+        fmt            = formats[best_key]
+        col_map        = fmt.get("columns", {})
+        headers_orig   = fmt_headers.get(best_key, [])
+        matched        = {}
 
-            found = None
+        for role in ("temp", "humid"):
+            cfg_val  = col_map.get(role, "") or ""
+            cfg_name = cfg_val.strip().lower()
+            found    = None
+
             if cfg_name == "":
-                # config 값이 "" → 헤더도 빈 문자열인 첫 번째 셀만 매치
-                for orig in best_headers_raw:
-                    if orig.strip() == "":
+                # config "" → 빈 헤더 셀인 첫 번째 열
+                for orig in headers_orig:
+                    if orig == "":
                         found = ""
                         break
             else:
-                # config 값이 있으면 부분 문자열 매칭
-                # 단, 헤더가 빈 문자열인 셀은 매치 대상에서 제외
-                for orig in best_headers_raw:
-                    if orig.strip() == "":
-                        continue   # 빈 헤더는 config가 ""일 때만 매치
-                    lo = orig.lower()
-                    if cfg_name in lo or lo in cfg_name:
+                # config 값 있음 → 빈 헤더 제외하고 부분 문자열 매칭
+                for orig in headers_orig:
+                    if orig == "":
+                        continue
+                    if cfg_name in orig.lower() or orig.lower() in cfg_name:
                         found = orig
                         break
-            matched[role] = found   # None 이면 못 찾은 것
+
+            matched[role] = found   # None → 못 찾음
 
         return best_key, matched
     finally:
