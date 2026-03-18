@@ -51,7 +51,8 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 def analyze_trends(values: list, min_rows: int, fill_rows: int,
                    normal_rows: int = 0,
-                   normal_rate_diff: float = 0.0) -> list:
+                   normal_rate_diff: float = 0.0,
+                   min_rate_abs: float = 0.0) -> list:
     """
     UP/DOWN 추세 분석.
 
@@ -70,6 +71,9 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
 
       Step4: min_rows 처리 (fill + normal 완료 후 적용)
              연속 길이 < min_rows 인 구간을 "" 처리
+
+      Step5: min_rate_abs 처리 (마지막 단계)
+             UP/DOWN 구간의 평균 변화율 절대값 < min_rate_abs 이면 "" 처리
     """
     n = len(values)
     if n == 0:
@@ -186,6 +190,25 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
         if d in ("UP", "DOWN") and (e - s + 1) >= min_rows:
             for k in range(s, e + 1):
                 result[k] = d
+
+    # ── Step5: min_rate_abs 미만 구간 → "" (마지막 단계) ─────
+    if min_rate_abs > 0.0:
+        # 결과 구간 재추출
+        segs5 = []
+        i = 0
+        while i < n:
+            d = result[i]; j = i
+            while j < n and result[j] == d: j += 1
+            segs5.append((i, j - 1, d))
+            i = j
+        for s, e, d in segs5:
+            if d not in ("UP", "DOWN"):
+                continue
+            length = e - s + 1
+            avg_rate = abs(values[e] - values[s]) / length if length > 1 else 0.0
+            if avg_rate < min_rate_abs:
+                for k in range(s, e + 1):
+                    result[k] = ""
 
     return result
 
@@ -895,7 +918,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                           int(t_cfg["min_rows"]),
                                           int(t_cfg["fill_rows"]),
                                           int(t_cfg.get("normal_rows", 0)),
-                                          float(t_cfg.get("normal_rate_diff", 0.0)))
+                                          float(t_cfg.get("normal_rate_diff", 0.0)),
+                                          float(t_cfg.get("min_rate_abs", 0.0)))
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
                 rates_t = calc_rate_per_min(temp_vals, timestamps, t_trends)
@@ -918,7 +942,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                           int(h_cfg["min_rows"]),
                                           int(h_cfg["fill_rows"]),
                                           int(h_cfg.get("normal_rows", 0)),
-                                          float(h_cfg.get("normal_rate_diff", 0.0)))
+                                          float(h_cfg.get("normal_rate_diff", 0.0)),
+                                          float(h_cfg.get("min_rate_abs", 0.0)))
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
                 rates_h = calc_rate_per_min(humid_vals, timestamps, h_trends)
@@ -1089,11 +1114,13 @@ class SensorConfigFrame(tk.LabelFrame):
         self.fill_rows_var        = tk.StringVar(value=str(init.get("fill_rows",        1)))
         self.normal_rows_var      = tk.StringVar(value=str(init.get("normal_rows",      0)))
         self.normal_rate_diff_var = tk.StringVar(value=str(init.get("normal_rate_diff", 0.0)))
+        self.min_rate_abs_var     = tk.StringVar(value=str(init.get("min_rate_abs",     0.0)))
         for i, (lbl, var) in enumerate([
-            ("min_rows         (UP/DOWN 최소 연속 행)",    self.min_rows_var),
             ("fill_rows        (flat 허용 연속 행)",       self.fill_rows_var),
             ("normal_rows      (노이즈 연결 최대 행)",     self.normal_rows_var),
             ("normal_rate_diff (연결 허용 변화율 차이)",   self.normal_rate_diff_var),
+            ("min_rows         (UP/DOWN 최소 연속 행)",    self.min_rows_var),
+            ("min_rate_abs     (최소 평균 변화율 절대값)", self.min_rate_abs_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
@@ -1102,10 +1129,11 @@ class SensorConfigFrame(tk.LabelFrame):
                      relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"min_rows":         int(self.min_rows_var.get()),
-                "fill_rows":        int(self.fill_rows_var.get()),
+        return {"fill_rows":        int(self.fill_rows_var.get()),
                 "normal_rows":      int(self.normal_rows_var.get()),
-                "normal_rate_diff": float(self.normal_rate_diff_var.get())}
+                "normal_rate_diff": float(self.normal_rate_diff_var.get()),
+                "min_rows":         int(self.min_rows_var.get()),
+                "min_rate_abs":     float(self.min_rate_abs_var.get())}
 
 
 # ══════════════════════════════════════════════
