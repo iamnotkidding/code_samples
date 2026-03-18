@@ -2,7 +2,7 @@
 Excel Trend Analyzer — Temperature & Humidity
 - win32com.client 단독 사용 (openpyxl 미사용)
 - 셀 색깔 / 폰트 / 정렬 없음 — 값만 기록
-- 3가지 입력 포맷 지원 (config.json)
+- 3가지 입력 포맷 지원 (설정 파일명은 스크립트명과 동일)
 - 전체 시트 각각 독립 처리
 - 온도 / 습도 각각 독립 min_rows
 - 결과: 입력 파일에 직접 Temp_Trend / Humid_Trend 컬럼 추가 후 저장
@@ -34,8 +34,8 @@ else:
 def load_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(
-            f"config.json 파일이 없습니다.\n"
-            f"실행 경로에 config.json 을 생성한 후 다시 시작하세요.\n"
+            f"{os.path.basename(CONFIG_FILE)} 파일이 없습니다.\n"
+            f"실행 경로에 {os.path.basename(CONFIG_FILE)} 을 생성한 후 다시 시작하세요.\n"
             f"경로: {os.path.abspath(CONFIG_FILE)}")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -49,22 +49,28 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
-def analyze_trends(values: list, min_rows: int, fill_rows: int) -> list:
+def analyze_trends(values: list, min_rows: int, fill_rows: int,
+                   normal_rows: int = 0,
+                   normal_rate_diff: float = 0.0) -> list:
     """
-    UP/DOWN 추세 분석 (4단계).
+    UP/DOWN 추세 분석.
 
-    Step1: 값 비교로 raw 방향 결정
-           values[i] > values[i-1] → UP
-           values[i] < values[i-1] → DOWN
-           values[i] == values[i-1] → "" (flat)
-           index 0 은 항상 ""
+    처리 순서:
+      Step1: 인접 값 비교로 raw 방향 결정
 
-    Step2: UP 구간 사이에 flat이 fill_rows 이하면 UP으로 채움
-           (UP ... flat×N ... UP  →  N <= fill_rows 이면 flat을 UP으로)
+      Step2: fill_rows 처리 (UP/DOWN 각 2회)
+             같은 방향 구간 사이 flat("") 이 fill_rows 이하면 채움
 
-    Step3: DOWN 구간 사이에 flat이 fill_rows 이하면 DOWN으로 채움
+      Step3: normal_rows 처리
+             UP 구간 사이에 끼인 DOWN/flat 구간이
+               - 양쪽 UP 구간 각각보다 짧고
+               - normal_rows 미만이고
+               - normal_rate_diff > 0 이면:
+                 양쪽 UP 구간의 평균 변화율 차이가 normal_rate_diff 이내일 때만 연결
+             → UP/DOWN 각 2회 반복
 
-    Step4: 연속 UP/DOWN 길이가 min_rows 미만이면 "" (ignore)
+      Step4: min_rows 처리 (fill + normal 완료 후 적용)
+             연속 길이 < min_rows 인 구간을 "" 처리
     """
     n = len(values)
     if n == 0:
@@ -76,50 +82,109 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int) -> list:
         if   values[i] > values[i - 1]: raw[i] = "UP"
         elif values[i] < values[i - 1]: raw[i] = "DOWN"
 
-    # ── Step2 & 3: 방향 사이 flat 채움 ──────────────────────
+    # ── Step2: fill_rows 처리 (UP/DOWN 각 2회) ───────────────
     def fill_flat_between(direction: str, data: list) -> list:
-        """
-        같은 direction 구간 사이에 끼인 flat("") 구간이
-        fill_rows 이하면 해당 방향으로 채움.
-        """
+        """같은 direction 구간 사이 flat이 fill_rows 이하면 채움"""
         result = data[:]
         i = 0
         while i < n:
             if result[i] != direction:
-                i += 1
-                continue
-            # direction 구간 끝 찾기
+                i += 1; continue
             j = i
-            while j < n and result[j] == direction:
-                j += 1
-            # j부터 flat 구간 길이 측정
+            while j < n and result[j] == direction: j += 1
             k = j
-            while k < n and result[k] == "":
-                k += 1
+            while k < n and result[k] == "": k += 1
             flat_len = k - j
-            # flat 뒤가 같은 direction 이고 flat 길이 <= fill_rows 이면 채움
             if k < n and result[k] == direction and flat_len <= fill_rows:
-                for idx in range(j, k):
-                    result[idx] = direction
-                i = k  # 채운 구간 이후부터 재탐색
+                for idx in range(j, k): result[idx] = direction
+                i = k
             else:
                 i = j
         return result
 
-    # UP/DOWN 각각 2회씩 실행 (1회로 이어지지 않는 구간을 2회차에 처리)
     filled = fill_flat_between("UP",   raw)
     filled = fill_flat_between("DOWN", filled)
     filled = fill_flat_between("UP",   filled)
     filled = fill_flat_between("DOWN", filled)
 
-    # ── Step4: min_rows 미만 구간 → "" (ignore) ─────────────
-    # 연속 구간 추출
+    # ── Step3: normal_rows 처리 ──────────────────────────────
+    def seg_rate(seg) -> float:
+        """구간의 평균 변화율 = (끝값 - 시작값) / 구간길이"""
+        s, e, _ = seg
+        length = e - s + 1
+        if length <= 1:
+            return 0.0
+        return (values[e] - values[s]) / length
+
+    def normalize_between(outer: str, data: list) -> list:
+        """
+        outer 구간 사이에 끼인 구간(inner)이 다음 조건을 모두 만족하면
+        outer 로 덮어써서 연결한다.
+          - inner 길이 < outer_left 길이
+          - inner 길이 < outer_right 길이
+          - inner 길이 < normal_rows
+          - normal_rate_diff > 0 이면:
+            left 구간과 right 구간의 평균 변화율 차이 <= normal_rate_diff
+        inner는 "" 또는 outer 반대 방향 모두 대상.
+        """
+        if normal_rows <= 0:
+            return data[:]
+        result = data[:]
+
+        changed = True
+        while changed:
+            changed = False
+            segs = []
+            i = 0
+            while i < n:
+                d = result[i]; j = i
+                while j < n and result[j] == d: j += 1
+                segs.append([i, j - 1, d])
+                i = j
+
+            for si in range(1, len(segs) - 1):
+                left  = segs[si - 1]
+                mid   = segs[si]
+                right = segs[si + 1]
+
+                if left[2] != outer or right[2] != outer:
+                    continue
+
+                mid_len   = mid[1] - mid[0] + 1
+                left_len  = left[1] - left[0] + 1
+                right_len = right[1] - right[0] + 1
+
+                if not (mid_len < left_len and
+                        mid_len < right_len and
+                        mid_len < normal_rows):
+                    continue
+
+                # normal_rate_diff 조건 검사
+                if normal_rate_diff > 0:
+                    r_left  = seg_rate(left)
+                    r_right = seg_rate(right)
+                    if abs(r_left - r_right) > normal_rate_diff:
+                        continue   # 변화율 차이가 너무 크면 연결 안 함
+
+                for k in range(mid[0], mid[1] + 1):
+                    result[k] = outer
+                changed = True
+                break
+
+        return result
+
+    if normal_rows > 0:
+        filled = normalize_between("UP",   filled)
+        filled = normalize_between("DOWN", filled)
+        filled = normalize_between("UP",   filled)
+        filled = normalize_between("DOWN", filled)
+
+    # ── Step4: min_rows 미만 구간 → "" (fill+normal 완료 후) ─
     segments = []
     i = 0
     while i < n:
         d = filled[i]; j = i
-        while j < n and filled[j] == d:
-            j += 1
+        while j < n and filled[j] == d: j += 1
         segments.append((i, j - 1, d))
         i = j
 
@@ -128,7 +193,6 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int) -> list:
         if d in ("UP", "DOWN") and (e - s + 1) >= min_rows:
             for k in range(s, e + 1):
                 result[k] = d
-        # min_rows 미만 또는 flat → "" 유지
 
     return result
 
@@ -483,48 +547,219 @@ def add_chart(ws, xl_app,
               header_row: int, data_start_row: int, data_rows: int,
               time_col: int,
               val_col: int, up_col: int, dn_col: int,
-              chart_title: str, chart_left: float, chart_top: float):
+              chart_title: str, chart_left: float, chart_top: float,
+              rate_col: int = -1,
+              chart_width: float = 420, chart_height: float = 280):
     """
     분산형(XY Scatter) 차트를 ws에 추가.
     - Series 1: 시간 vs 원본값
     - Series 2: 시간 vs UP값
     - Series 3: 시간 vs DOWN값
-    chart_left, chart_top: 차트 위치 (포인트 단위)
+    - Series 4: (옵션) 시간 vs 분당변화량 (보조 Y축)
+    반환: chart_obj
     """
     # xlXYScatter = -4169
-    chart_obj = ws.ChartObjects().Add(chart_left, chart_top, 400, 250)
+    chart_obj = ws.ChartObjects().Add(chart_left, chart_top,
+                                      chart_width, chart_height)
     chart     = chart_obj.Chart
     chart.ChartType = -4169   # xlXYScatter
 
     data_end = data_start_row + data_rows - 1
 
-    def add_series(name, x_col, y_col, color_rgb, marker_size=3):
+    def add_series(name, x_col, y_col, color_rgb, marker_size=3, axis_group=1):
         sr = chart.SeriesCollection().NewSeries()
         sr.Name = name
         sr.XValues = ws.Range(ws.Cells(data_start_row, x_col),
                               ws.Cells(data_end, x_col))
         sr.Values  = ws.Range(ws.Cells(data_start_row, y_col),
                               ws.Cells(data_end, y_col))
-        sr.Format.Line.Visible   = 0    # 선 없음
+        sr.Format.Line.Visible   = 0
         sr.MarkerStyle           = 2    # xlMarkerStylePlus
         sr.MarkerSize            = marker_size
         sr.MarkerForegroundColor = color_rgb
         sr.MarkerBackgroundColor = color_rgb
+        sr.AxisGroup             = axis_group   # 1=주축, 2=보조축
 
-    # 원본 시리즈 먼저 추가 → Y축 범위가 실제 값 기준으로 설정됨
-    add_series("원본", time_col, val_col, 0xAAAAAA, marker_size=2)  # 연회색
-    add_series("UP",   time_col, up_col,  0x00AA44, marker_size=4)  # 초록
-    add_series("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)  # 빨강
+    # 원본 시리즈 먼저 → Y축 범위가 실제 값 기준으로 설정됨
+    add_series("원본", time_col, val_col, 0xAAAAAA, marker_size=2)
+    add_series("UP",   time_col, up_col,  0x00AA44, marker_size=4)
+    add_series("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)
 
-    # 빈칸(빈 셀)은 보간하지 않고 건너뜀 (xlDisplayBlanksAs: 0=gaps)
+    # 분당변화량 시리즈 (보조 Y축)
+    if rate_col > 0:
+        add_series("변화량(분당)", time_col, rate_col,
+                   0x0066CC, marker_size=3, axis_group=2)
+        try:
+            chart.Axes(2, 2).HasTitle = True   # xlSecondary=2
+            chart.Axes(2, 2).AxisTitle.Text = "변화량(/min)"
+        except Exception:
+            pass
+
+    # 빈칸은 gaps 처리
     chart.DisplayBlanksAs = 0
 
     chart.HasTitle = True
-    chart.ChartTitle.Text = chart_title
+    chart.ChartTitle.Text = f"{sheet_name} {chart_title}"
     chart.Axes(1).HasTitle = True
     chart.Axes(1).AxisTitle.Text = "시간"
     chart.Axes(2).HasTitle = True
     chart.Axes(2).AxisTitle.Text = chart_title
+
+    return chart_obj
+
+
+
+def _extract_groups(values: list, trends: list, rates: list, direction: str) -> list:
+    """
+    direction(UP/DOWN) 구간 그룹 목록 반환.
+    각 항목: {"rate": float, "length": int}
+    rate는 그룹 내 첫 번째 유효 rate 값 사용 (그룹 내 모든 행 동일).
+    """
+    groups = []
+    n = len(trends)
+    i = 0
+    while i < n:
+        if trends[i] == direction:
+            j = i
+            while j < n and trends[j] == direction:
+                j += 1
+            length = j - i
+            # 그룹 내 rate 값 (첫 번째 유효값)
+            rate = ""
+            for k in range(i, j):
+                if k < len(rates) and isinstance(rates[k], (int, float)):
+                    rate = rates[k]
+                    break
+            groups.append({"rate": rate, "length": length})
+            i = j
+        else:
+            i += 1
+    return groups
+
+
+def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
+    """
+    Result 시트를 생성(또는 덮어쓰기).
+
+    테이블 구조:
+      행 1: 시트명 헤더
+      행 2~: 각 시트별 섹션
+        - 온도 UP 그룹 행들 (변화량, 길이)
+        - 온도 DOWN 그룹 행들
+        - 습도 UP 그룹 행들
+        - 습도 DOWN 그룹 행들
+
+    컬럼: 시트명 | 센서 | 방향 | 그룹번호 | 길이(행) | 변화량(/min)
+    """
+    def llog(msg):
+        if log: log(msg)
+
+    RESULT_NAME = "Result"
+
+    # 기존 Result 시트 제거
+    for sh in wb.Sheets:
+        if sh.Name == RESULT_NAME:
+            sh.Delete()
+            break
+
+    ws_r = wb.Sheets.Add(After=wb.Sheets(wb.Sheets.Count))
+    ws_r.Name = RESULT_NAME
+
+    # ── 헤더 ─────────────────────────────────────────────────
+    HDR = ["시트명", "센서", "방향", "그룹번호", "길이(행)", "변화량(/min)"]
+    for ci, h in enumerate(HDR, 1):
+        ws_r.Cells(1, ci).Value = h
+
+    row = 2
+
+    for info in sheet_chart_infos:
+        sname   = info["sheet_name"]
+        rates_t = info["rates_t"]
+        rates_h = info["rates_h"]
+        trends_t = info["trends_t"]
+        trends_h = info["trends_h"]
+
+        # 온도 UP/DOWN 그룹
+        for direction in ("UP", "DOWN"):
+            groups = _extract_groups(info["temp_vals"], trends_t, rates_t, direction)
+            for gi, g in enumerate(groups, 1):
+                ws_r.Cells(row, 1).Value = sname
+                ws_r.Cells(row, 2).Value = "온도"
+                ws_r.Cells(row, 3).Value = direction
+                ws_r.Cells(row, 4).Value = gi
+                ws_r.Cells(row, 5).Value = g["length"]
+                ws_r.Cells(row, 6).Value = g["rate"]
+                row += 1
+
+        # 습도 UP/DOWN 그룹
+        for direction in ("UP", "DOWN"):
+            groups = _extract_groups(info["humid_vals"], trends_h, rates_h, direction)
+            for gi, g in enumerate(groups, 1):
+                ws_r.Cells(row, 1).Value = sname
+                ws_r.Cells(row, 2).Value = "습도"
+                ws_r.Cells(row, 3).Value = direction
+                ws_r.Cells(row, 4).Value = gi
+                ws_r.Cells(row, 5).Value = g["length"]
+                ws_r.Cells(row, 6).Value = g["rate"]
+                row += 1
+
+    table_last_row = row - 1
+
+    # 열 너비 자동 조정
+    ws_r.Columns("A:F").AutoFit()
+    llog(f"  [Result] 변화량 테이블 작성 완료 (총 {table_last_row - 1}행)")
+
+    # ── 차트를 Result 시트에 추가 ────────────────────────────
+    CHART_W = 420; CHART_H = 280
+    # 테이블 높이 추정 (행당 약 15pt) + 여백
+    chart_top_start = table_last_row * 15 + 30
+
+    for si, info in enumerate(sheet_chart_infos):
+        ws_src = None
+        try:
+            ws_src = wb.Sheets(info["sheet_name"])
+        except Exception:
+            continue
+
+        row_top = chart_top_start + si * (CHART_H + 10)
+        left_t  = 5
+        left_h  = left_t + CHART_W + 10
+
+        if (info["time_col"] > 0 and info["val_col_t"] > 0
+                and info["t_up_col"] > 0 and info["t_dn_col"] > 0):
+            try:
+                add_chart(ws_src, None,
+                          info["sheet_name"],
+                          info["header_row"], info["data_start_row"],
+                          info["data_rows"],
+                          info["time_col"],
+                          info["val_col_t"], info["t_up_col"], info["t_dn_col"],
+                          "온도", left_t, row_top,
+                          rate_col=info["t_rate_col"],
+                          chart_width=CHART_W, chart_height=CHART_H)
+                co = ws_src.ChartObjects(ws_src.ChartObjects().Count)
+                co.Chart.Location(2, RESULT_NAME)
+            except Exception as e:
+                llog(f"  [Result] {info['sheet_name']} 온도 차트 이동 실패: {e}")
+
+        if (info["time_col"] > 0 and info["val_col_h"] > 0
+                and info["h_up_col"] > 0 and info["h_dn_col"] > 0):
+            try:
+                add_chart(ws_src, None,
+                          info["sheet_name"],
+                          info["header_row"], info["data_start_row"],
+                          info["data_rows"],
+                          info["time_col"],
+                          info["val_col_h"], info["h_up_col"], info["h_dn_col"],
+                          "습도", left_h, row_top,
+                          rate_col=info["h_rate_col"],
+                          chart_width=CHART_W, chart_height=CHART_H)
+                co = ws_src.ChartObjects(ws_src.ChartObjects().Count)
+                co.Chart.Location(2, RESULT_NAME)
+            except Exception as e:
+                llog(f"  [Result] {info['sheet_name']} 습도 차트 이동 실패: {e}")
+
+    llog(f"  [Result] 차트 {len(sheet_chart_infos) * 2}개 추가 완료")
 
 
 def write_trend_col(ws, header_row: int, data_start_row: int,
@@ -609,6 +844,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
     # 원본 파일 직접 열기 (복사 없음)
     xl, wb = _xl_open(filepath)
     processed = []
+    sheet_chart_infos = []   # Result 시트용 차트 정보
 
     try:
         for sheet_name, scfg in sheet_cfg_map.items():
@@ -658,16 +894,20 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             t_trend_col = h_trend_col = -1
             t_up_col = t_dn_col = h_up_col = h_dn_col = -1
+            t_rate_col = h_rate_col = -1
+            rates_t = rates_h = []
 
             if temp_vals:
                 t_trends = analyze_trends(temp_vals,
                                           int(t_cfg["min_rows"]),
-                                          int(t_cfg["fill_rows"]))
+                                          int(t_cfg["fill_rows"]),
+                                          int(t_cfg.get("normal_rows", 0)),
+                                          float(t_cfg.get("normal_rate_diff", 0.0)))
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
-                rates = calc_rate_per_min(temp_vals, timestamps, t_trends)
+                rates_t = calc_rate_per_min(temp_vals, timestamps, t_trends)
                 write_trend_col(ws, header_row, data_start_row,
-                                "Temp_Rate", rates)
+                                "Temp_Rate", rates_t)
                 t_up_vals, t_dn_vals = make_updown_vals(temp_vals, t_trends)
                 t_up_col = write_trend_col(ws, header_row, data_start_row,
                                            "Temp_UP", t_up_vals)
@@ -683,12 +923,14 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if humid_vals:
                 h_trends = analyze_trends(humid_vals,
                                           int(h_cfg["min_rows"]),
-                                          int(h_cfg["fill_rows"]))
+                                          int(h_cfg["fill_rows"]),
+                                          int(h_cfg.get("normal_rows", 0)),
+                                          float(h_cfg.get("normal_rate_diff", 0.0)))
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
-                rates = calc_rate_per_min(humid_vals, timestamps, h_trends)
+                rates_h = calc_rate_per_min(humid_vals, timestamps, h_trends)
                 write_trend_col(ws, header_row, data_start_row,
-                                "Humid_Rate", rates)
+                                "Humid_Rate", rates_h)
                 h_up_vals, h_dn_vals = make_updown_vals(humid_vals, h_trends)
                 h_up_col = write_trend_col(ws, header_row, data_start_row,
                                            "Humid_UP", h_up_vals)
@@ -705,20 +947,45 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             val_col_t = find_col_ws(temp_col_name)
             val_col_h = find_col_ws(humid_col_name)
 
+            t_rate_col = find_col_ws("Temp_Rate")
+            h_rate_col = find_col_ws("Humid_Rate")
+
+            # 시트별 차트 정보 저장 (Result 시트용)
+            chart_info = {
+                "sheet_name":    sheet_name,
+                "header_row":    header_row,
+                "data_start_row": data_start_row,
+                "data_rows":     data_rows,
+                "time_col":      time_axis_col,
+                "val_col_t":     val_col_t,
+                "t_up_col":      t_up_col,
+                "t_dn_col":      t_dn_col,
+                "t_rate_col":    t_rate_col,
+                "val_col_h":     val_col_h,
+                "h_up_col":      h_up_col,
+                "h_dn_col":      h_dn_col,
+                "h_rate_col":    h_rate_col,
+                "rates_t":       list(rates_t) if temp_vals else [],
+                "rates_h":       list(rates_h) if humid_vals else [],
+                "trends_t":      list(t_trends) if temp_vals else [],
+                "trends_h":      list(h_trends) if humid_vals else [],
+                "temp_vals":     list(temp_vals),
+                "humid_vals":    list(humid_vals),
+            }
+            sheet_chart_infos.append(chart_info)
+
             if time_axis_col > 0 and temp_vals and val_col_t > 0                     and t_up_col > 0 and t_dn_col > 0:
                 add_chart(ws, xl, sheet_name,
                           header_row, data_start_row, data_rows,
-                          time_axis_col,
-                          val_col_t, t_up_col, t_dn_col,
-                          "온도", 10, 20)
+                          time_axis_col, val_col_t, t_up_col, t_dn_col,
+                          "온도", 10, 20, rate_col=t_rate_col)
                 log(f"  [{sheet_name}] 🌡 온도 차트 추가")
 
             if time_axis_col > 0 and humid_vals and val_col_h > 0                     and h_up_col > 0 and h_dn_col > 0:
                 add_chart(ws, xl, sheet_name,
                           header_row, data_start_row, data_rows,
-                          time_axis_col,
-                          val_col_h, h_up_col, h_dn_col,
-                          "습도", 420, 20)
+                          time_axis_col, val_col_h, h_up_col, h_dn_col,
+                          "습도", 440, 20, rate_col=h_rate_col)
                 log(f"  [{sheet_name}] 💧 습도 차트 추가")
 
             if sheet_done:
@@ -726,13 +993,20 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 if sheet_result_cb:
                     sheet_result_cb(sheet_name, _t_up, _t_down, _h_up, _h_down)
 
+        # ── Result 시트 생성 ──────────────────────────────
+        log("  [Result] 시트 생성 중...")
+        _build_result_sheet(wb, sheet_chart_infos, log)
+
         xl.ScreenUpdating = True
         wb.Save()
         xl.Visible = True
+        wb.Activate()
+        xl.WindowState = -4137   # xlMaximized
         log(f"\n완료: {os.path.basename(filepath)}  ({len(processed)}개 시트)")
 
     except Exception as e:
         xl.ScreenUpdating = True
+        xl.Visible = True
         wb.Close(False); xl.Quit(); raise e
 
     return filepath, processed
@@ -818,11 +1092,15 @@ class SensorConfigFrame(tk.LabelFrame):
                          bg=bg, fg=fg, bd=1, relief="groove",
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
-        self.min_rows_var  = tk.StringVar(value=str(init.get("min_rows",  3)))
-        self.fill_rows_var = tk.StringVar(value=str(init.get("fill_rows", 1)))
+        self.min_rows_var         = tk.StringVar(value=str(init.get("min_rows",         3)))
+        self.fill_rows_var        = tk.StringVar(value=str(init.get("fill_rows",        1)))
+        self.normal_rows_var      = tk.StringVar(value=str(init.get("normal_rows",      0)))
+        self.normal_rate_diff_var = tk.StringVar(value=str(init.get("normal_rate_diff", 0.0)))
         for i, (lbl, var) in enumerate([
-            ("min_rows  (UP/DOWN 최소 연속 행)", self.min_rows_var),
-            ("fill_rows (flat 허용 연속 행)",    self.fill_rows_var),
+            ("min_rows         (UP/DOWN 최소 연속 행)",    self.min_rows_var),
+            ("fill_rows        (flat 허용 연속 행)",       self.fill_rows_var),
+            ("normal_rows      (노이즈 연결 최대 행)",     self.normal_rows_var),
+            ("normal_rate_diff (연결 허용 변화율 차이)",   self.normal_rate_diff_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
@@ -831,8 +1109,10 @@ class SensorConfigFrame(tk.LabelFrame):
                      relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"min_rows":  int(self.min_rows_var.get()),
-                "fill_rows": int(self.fill_rows_var.get())}
+        return {"min_rows":         int(self.min_rows_var.get()),
+                "fill_rows":        int(self.fill_rows_var.get()),
+                "normal_rows":      int(self.normal_rows_var.get()),
+                "normal_rate_diff": float(self.normal_rate_diff_var.get())}
 
 
 # ══════════════════════════════════════════════
@@ -858,7 +1138,7 @@ class SheetRow:
 
     def set_result(self, t_up, t_down, h_up, h_down):
         self._result_var.set(
-            f"🌡UP그룹={t_up} DN그룹={t_down}  💧UP그룹={h_up} DN그룹={h_down}")
+            f"🌡UP그룹={t_up} DOWN그룹={t_down}  💧UP그룹={h_up} DOWN그룹={h_down}")
         # UP 또는 DOWN 이 1개 이상이면 파란색, 모두 0이면 기본색
         has_result = (t_up + t_down + h_up + h_down) > 0
         self._result_lbl.configure(fg="#89B4FA" if has_result else "#585B70")
@@ -979,7 +1259,7 @@ class App(tk.Tk):
         self._sep()
 
         # 센서 설정
-        tk.Label(self, text="⚙ 설정 (config.json)",
+        tk.Label(self, text=f"⚙ 설정 ({os.path.basename(CONFIG_FILE)})",
                  font=("Segoe UI", 10, "bold"),
                  bg=self.BG, fg="#A6E3A1").pack(pady=(0, 4))
 
@@ -1041,7 +1321,7 @@ class App(tk.Tk):
     def _edit_fmt(self):
         keys = list(self.config_data["formats"].keys())
         if not keys:
-            messagebox.showinfo("알림", "config.json에 formats가 없습니다."); return
+            messagebox.showinfo("알림", f"{os.path.basename(CONFIG_FILE)}에 formats가 없습니다."); return
         # 현재 인식된 포맷을 기본 선택
         cur = getattr(self, "_detected_fmt", keys[0])
         if cur not in keys: cur = keys[0]
@@ -1156,8 +1436,10 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, fill_rows={cfg['temp']['fill_rows']}\n"
-                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, fill_rows={cfg['humid']['fill_rows']}")
+                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, fill_rows={cfg['temp']['fill_rows']}, "
+                f"normal_rows={cfg['temp']['normal_rows']}, normal_rate_diff={cfg['temp']['normal_rate_diff']}\n"
+                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, fill_rows={cfg['humid']['fill_rows']}, "
+                f"normal_rows={cfg['humid']['normal_rows']}, normal_rate_diff={cfg['humid']['normal_rate_diff']}")
         except ValueError:
             messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
