@@ -63,7 +63,6 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
 
       Step3: normal_rows 처리
              UP 구간 사이에 끼인 DOWN/flat 구간이
-               - 양쪽 UP 구간 각각보다 짧고
                - normal_rows 미만이고
                - normal_rate_diff > 0 이면:
                  양쪽 UP 구간의 평균 변화율 차이가 normal_rate_diff 이내일 때만 연결
@@ -120,8 +119,6 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
         """
         outer 구간 사이에 끼인 구간(inner)이 다음 조건을 모두 만족하면
         outer 로 덮어써서 연결한다.
-          - inner 길이 < outer_left 길이
-          - inner 길이 < outer_right 길이
           - inner 길이 < normal_rows
           - normal_rate_diff > 0 이면:
             left 구간과 right 구간의 평균 변화율 차이 <= normal_rate_diff
@@ -150,13 +147,9 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
                 if left[2] != outer or right[2] != outer:
                     continue
 
-                mid_len   = mid[1] - mid[0] + 1
-                left_len  = left[1] - left[0] + 1
-                right_len = right[1] - right[0] + 1
+                mid_len = mid[1] - mid[0] + 1
 
-                if not (mid_len < left_len and
-                        mid_len < right_len and
-                        mid_len < normal_rows):
+                if mid_len >= normal_rows:
                     continue
 
                 # normal_rate_diff 조건 검사
