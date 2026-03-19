@@ -36,15 +36,15 @@
   "temp": {
     "max_fill_rows": 2,
     "max_normal_rows": 0,
-    "min_normal_rate_diff": 0.0,
     "min_rows": 3,
-    "min_rate_abs": 0.0
+    "min_rate_abs": 0.0,
+    "max_normal_rate_diff": 0.0
   },
   "humid": {
     "max_fill_rows": 2,
     "max_normal_rows": 0,
-    "min_normal_rate_diff": 0.0,
     "min_rows": 3,
-    "min_rate_abs": 0.0
+    "min_rate_abs": 0.0,
+    "max_normal_rate_diff": 0.0
   }
 }
