@@ -1,4 +1,3 @@
-
 """
 Excel Trend Analyzer — Temperature & Humidity
 - win32com.client 단독 사용 (openpyxl 미사용)
