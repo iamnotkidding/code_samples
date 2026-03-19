@@ -52,21 +52,21 @@ def save_config(cfg: dict):
 def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
                    max_normal_rows: int = 0,
                    max_normal_rate_diff: float = 0.0,
-                   min_rate_abs: float = 0.0) -> list:
+                   min_rate_abs: float = 0.0,
+                   timestamps: list = None) -> list:
     """
     UP/DOWN 추세 분석.
 
     처리 순서:
       Step1: 인접 값 비교로 raw 방향 결정
 
-      Step2: max_fill_rows 처리 (UP/DOWN 각 2회)
+      Step2: max_fill_rows 처리 (변경 없을 때까지 반복)
              같은 방향 구간 사이 flat("") 이 max_fill_rows 이하면 채움
 
-      Step3: max_normal_rows / max_normal_rate_diff 처리 (OR 조건)
+      Step3: max_normal_rows / max_normal_rate_diff 처리 (변경 없을 때까지 반복)
              UP 구간 사이에 끼인 DOWN/flat 구간이 다음 중 하나를 만족하면 연결
                - (max_normal_rows > 0) AND inner 길이 < max_normal_rows
                - (max_normal_rate_diff > 0) AND 양쪽 변화율 차이 <= max_normal_rate_diff
-             → UP/DOWN 각 2회 반복
 
       Step4: min_rows 처리 (fill + normal 완료 후 적용)
              연속 길이 < min_rows 인 구간을 "" 처리
@@ -84,39 +84,54 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
         if   values[i] > values[i - 1]: raw[i] = "UP"
         elif values[i] < values[i - 1]: raw[i] = "DOWN"
 
-    # ── Step2: max_fill_rows 처리 (UP/DOWN 각 2회) ───────────────
+    # ── Step2: max_fill_rows 처리 (변경 없을 때까지 반복) ───────
     def fill_flat_between(direction: str, data: list) -> list:
-        """같은 direction 구간 사이 flat이 max_fill_rows 이하면 채움"""
+        """같은 direction 구간 사이 flat이 max_fill_rows 이하면 채움.
+        변경 없을 때까지 반복."""
         result = data[:]
-        i = 0
-        while i < n:
-            if result[i] != direction:
-                i += 1; continue
-            j = i
-            while j < n and result[j] == direction: j += 1
-            k = j
-            while k < n and result[k] == "": k += 1
-            flat_len = k - j
-            if k < n and result[k] == direction and flat_len <= max_fill_rows:
-                for idx in range(j, k): result[idx] = direction
-                i = k
-            else:
-                i = j
+        changed = True
+        while changed:
+            changed = False
+            i = 0
+            while i < n:
+                if result[i] != direction:
+                    i += 1; continue
+                j = i
+                while j < n and result[j] == direction: j += 1
+                k = j
+                while k < n and result[k] == "": k += 1
+                flat_len = k - j
+                if k < n and result[k] == direction and flat_len <= max_fill_rows:
+                    for idx in range(j, k): result[idx] = direction
+                    changed = True
+                    i = k
+                else:
+                    i = j
         return result
 
-    filled = fill_flat_between("UP",   raw)
-    filled = fill_flat_between("DOWN", filled)
-    filled = fill_flat_between("UP",   filled)
-    filled = fill_flat_between("DOWN", filled)
+    # UP/DOWN 교차하며 변경 없을 때까지 반복
+    changed = True
+    filled = raw[:]
+    while changed:
+        prev = filled[:]
+        filled = fill_flat_between("UP",   filled)
+        filled = fill_flat_between("DOWN", filled)
+        changed = (filled != prev)
 
     # ── Step3: max_normal_rows 처리 ──────────────────────────────
     def seg_rate(seg) -> float:
-        """구간의 평균 변화율 = (끝값 - 시작값) / 구간길이"""
+        """구간의 평균 변화율 = (끝값 - 시작값) / 시간(분)
+        시간 정보 없으면 None 반환"""
         s, e, _ = seg
-        length = e - s + 1
-        if length <= 1:
-            return 0.0
-        return (values[e] - values[s]) / length
+        if e <= s:
+            return None
+        dv = values[e] - values[s]
+        ts_s = timestamps[s] if timestamps and s < len(timestamps) else None
+        ts_e = timestamps[e] if timestamps and e < len(timestamps) else None
+        if ts_s and ts_e and ts_e != ts_s:
+            dt = (ts_e - ts_s).total_seconds() / 60.0
+            return dv / dt if dt != 0 else None
+        return None   # 시간 정보 없음
 
     def normalize_between(outer: str, data: list) -> list:
         """
@@ -157,7 +172,8 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
                 if max_normal_rate_diff > 0:
                     r_left  = seg_rate(left)
                     r_right = seg_rate(right)
-                    cond_rate = (abs(r_left - r_right) <= max_normal_rate_diff)
+                    if r_left is not None and r_right is not None:
+                        cond_rate = (abs(r_left - r_right) <= max_normal_rate_diff)
 
                 if not (cond_rows or cond_rate):
                     continue
@@ -170,10 +186,13 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
         return result
 
     if max_normal_rows > 0 or max_normal_rate_diff > 0:
-        filled = normalize_between("UP",   filled)
-        filled = normalize_between("DOWN", filled)
-        filled = normalize_between("UP",   filled)
-        filled = normalize_between("DOWN", filled)
+        # UP/DOWN 교차하며 변경 없을 때까지 반복
+        changed = True
+        while changed:
+            prev = filled[:]
+            filled = normalize_between("UP",   filled)
+            filled = normalize_between("DOWN", filled)
+            changed = (filled != prev)
 
     # ── Step4: min_rows 미만 구간 → "" (fill+normal 완료 후) ─
     segments = []
@@ -203,8 +222,14 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
         for s, e, d in segs5:
             if d not in ("UP", "DOWN"):
                 continue
-            length = e - s + 1
-            avg_rate = abs(values[e] - values[s]) / length if length > 1 else 0.0
+            dv = abs(values[e] - values[s])
+            ts_s = timestamps[s] if timestamps and s < len(timestamps) else None
+            ts_e = timestamps[e] if timestamps and e < len(timestamps) else None
+            if ts_s and ts_e and ts_e != ts_s:
+                dt = (ts_e - ts_s).total_seconds() / 60.0
+                avg_rate = dv / dt if dt > 0 else 0.0
+            else:
+                continue   # 시간 정보 없으면 min_rate_abs 적용 불가, 건너뜀
             if avg_rate < min_rate_abs:
                 for k in range(s, e + 1):
                     result[k] = ""
@@ -365,41 +390,60 @@ def get_sheet_names(filepath: str) -> list:
         wb.Close(False); xl.Quit()
 
 
+def _excel_serial_to_dt(serial: float) -> datetime:
+    """Excel serial number → datetime (1899-12-30 기준)"""
+    return datetime(1899, 12, 30) + timedelta(days=serial)
+
+
+def _parse_val_to_dt(v) -> datetime:
+    """
+    단일 셀 값을 datetime으로 변환.
+    - datetime: 그대로 반환
+    - float/int: Excel serial number (날짜+시간 포함 가능)
+    - str: 여러 포맷 시도
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, (float, int)):
+        try:
+            return _excel_serial_to_dt(float(v))
+        except Exception:
+            return None
+    if isinstance(v, str):
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                    "%Y/%m/%d %H:%M",    "%Y-%m-%d %H:%M",
+                    "%Y/%m/%d",          "%Y-%m-%d",
+                    "%H:%M:%S",          "%H:%M"):
+            try:
+                return datetime.strptime(v.strip(), fmt)
+            except ValueError:
+                pass
+    return None
+
+
 def _parse_excel_dt(date_val, time_val):
     """
-    Excel COM에서 읽은 날짜/시간 값을 datetime으로 변환.
-    - date_val, time_val 이 모두 있으면 합산
-    - 하나만 있으면 그것만 사용
-    - Excel serial number(float) 또는 Python datetime/str 처리
-    """
-    def to_dt(v):
-        if v is None:
-            return None
-        if isinstance(v, datetime):
-            return v
-        if isinstance(v, float) or isinstance(v, int):
-            # Excel serial number → datetime (1900.1.1 기준)
-            try:
-                base = datetime(1899, 12, 30)
-                return base + timedelta(days=float(v))
-            except Exception:
-                return None
-        if isinstance(v, str):
-            for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
-                        "%Y/%m/%d", "%Y-%m-%d",
-                        "%H:%M:%S", "%H:%M"):
-                try: return datetime.strptime(v.strip(), fmt)
-                except ValueError: pass
-        return None
+    날짜 열 + 시간 열 값을 합쳐 datetime 반환.
 
-    dt_date = to_dt(date_val)
-    dt_time = to_dt(time_val)
+    규칙:
+      1. date_val 과 time_val 이 모두 있으면:
+         - date 부분(연/월/일)과 time 부분(시/분/초) 조합
+      2. time_val 만 있으면:
+         - time_val 이 날짜 정보 포함(serial or datetime)이면 그대로
+         - 시간만 있으면 시간만 사용 (날짜 없이)
+      3. date_val 만 있으면: date_val 사용
+    """
+    dt_date = _parse_val_to_dt(date_val)
+    dt_time = _parse_val_to_dt(time_val)
 
     if dt_date and dt_time:
-        # date 부분 + time 부분 합산
+        # 날짜 열의 연/월/일 + 시간 열의 시/분/초 조합
         return datetime(dt_date.year, dt_date.month, dt_date.day,
                         dt_time.hour, dt_time.minute, dt_time.second,
                         dt_time.microsecond)
+
     return dt_date or dt_time
 
 
@@ -472,30 +516,16 @@ def read_sheet(filepath: str, sheet_name: str,
         humid_vals = read_col_float(h_ci)
 
         # 타임스탬프 구성
+        # 날짜열 + 시간열 조합 / 시간열만 / 날짜열만 / 없음
         n = max(len(temp_vals), len(humid_vals))
-        if date_ci > 0 and time_ci > 0:
-            # Date + Time 컬럼 분리된 경우 합산
-            dates = read_col_raw(date_ci)
-            times = read_col_raw(time_ci)
-            timestamps = [
-                _parse_excel_dt(dates[i] if i < len(dates) else None,
-                                times[i] if i < len(times) else None)
-                for i in range(n)
-            ]
-        elif time_ci > 0:
-            times = read_col_raw(time_ci)
-            timestamps = [
-                _parse_excel_dt(None, times[i] if i < len(times) else None)
-                for i in range(n)
-            ]
-        elif date_ci > 0:
-            dates = read_col_raw(date_ci)
-            timestamps = [
-                _parse_excel_dt(dates[i] if i < len(dates) else None, None)
-                for i in range(n)
-            ]
-        else:
-            timestamps = [None] * n
+        dates = read_col_raw(date_ci) if date_ci > 0 else []
+        times = read_col_raw(time_ci) if time_ci > 0 else []
+
+        timestamps = []
+        for i in range(n):
+            d_val = dates[i] if i < len(dates) else None
+            t_val = times[i] if i < len(times) else None
+            timestamps.append(_parse_excel_dt(d_val, t_val))
 
         return temp_vals, humid_vals, timestamps
     finally:
@@ -507,7 +537,7 @@ def calc_rate_per_min(values: list, timestamps: list, trends: list) -> list:
     """
     각 그룹(연속 UP/DOWN 구간)의 분당 변화량을 계산.
     - 그룹 내 첫 행과 마지막 행의 값/시간 차이로 계산
-    - 시간 정보가 없으면 행 번호(인덱스) 기준으로 계산
+    - 시간 정보가 없으면 "" (빈칸) 반환
     - 유효하지 않은 행("")은 빈 문자열 반환
     반환: list[float | ""]  — 각 행의 분당 변화량 (그룹 내 모든 행에 동일값)
     """
@@ -535,15 +565,15 @@ def calc_rate_per_min(values: list, timestamps: list, trends: list) -> list:
         v_end   = values[e]
         dv      = v_end - v_start
 
-        # 시간 차이 계산 (분 단위)
+        # 시간 차이 계산 (분 단위) — 시간 정보 없으면 빈칸
         ts_start = timestamps[s] if timestamps and s < len(timestamps) else None
         ts_end   = timestamps[e] if timestamps and e < len(timestamps) else None
 
-        if ts_start and ts_end and ts_start != ts_end:
-            dt_minutes = (ts_end - ts_start).total_seconds() / 60.0
-        else:
-            # 시간 정보 없음 → 행 개수를 분으로 간주
-            dt_minutes = float(e - s) if e > s else 1.0
+        if not ts_start or not ts_end or ts_start == ts_end:
+            # 시간 정보 없음 → rate 계산 불가
+            continue
+
+        dt_minutes = (ts_end - ts_start).total_seconds() / 60.0
 
         if dt_minutes == 0:
             rate = 0.0
@@ -979,7 +1009,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                           int(t_cfg["max_fill_rows"]),
                                           int(t_cfg.get("max_normal_rows", 0)),
                                           float(t_cfg.get("max_normal_rate_diff", 0.0)),
-                                          float(t_cfg.get("min_rate_abs", 0.0)))
+                                          float(t_cfg.get("min_rate_abs", 0.0)),
+                                          timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
                 rates_t = calc_rate_per_min(temp_vals, timestamps, t_trends)
@@ -1006,7 +1037,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                                           int(h_cfg["max_fill_rows"]),
                                           int(h_cfg.get("max_normal_rows", 0)),
                                           float(h_cfg.get("max_normal_rate_diff", 0.0)),
-                                          float(h_cfg.get("min_rate_abs", 0.0)))
+                                          float(h_cfg.get("min_rate_abs", 0.0)),
+                                          timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
                 rates_h = calc_rate_per_min(humid_vals, timestamps, h_trends)
