@@ -1,0 +1,42 @@
+# ══════════════════════════════════════════════
+#  AutoTouch 샘플 스크립트
+#  설정 앱 자동 탐색
+# ══════════════════════════════════════════════
+
+# 1. 설정 앱 실행
+LAUNCH "com.android.settings"
+WAIT 2000
+
+# 2. Wi-Fi 메뉴 진입
+CLICK_TEXT "네트워크 및 인터넷"
+WAIT 1500
+
+# 3. 화면 스크롤
+SCROLL DOWN 2
+WAIT 1000
+
+# 4. 뒤로가기
+BACK
+WAIT 500
+
+# 5. 디스플레이 메뉴
+CLICK_TEXT "디스플레이"
+WAIT 1500
+
+# 6. 스크롤 후 뒤로가기
+SCROLL DOWN 3
+WAIT 500
+BACK
+WAIT 500
+
+# 7. 반복: 아래 스크롤 3회
+REPEAT 3
+  SCROLL DOWN
+  WAIT 800
+END_REPEAT
+
+# 8. 완료 알림
+TOAST "설정 탐색 완료!"
+
+# 9. 홈으로 복귀
+HOME

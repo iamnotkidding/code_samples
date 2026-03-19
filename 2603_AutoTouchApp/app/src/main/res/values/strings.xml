@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AutoTouch</string>
+    <string name="accessibility_description">AutoTouch는 스크립트 기반으로 화면의 UI 요소를 자동으로 클릭, 스크롤, 입력하는 자동화 도구입니다. 이 서비스는 사용자가 직접 작성한 스크립트 명령에 따라 화면을 제어합니다.</string>
+</resources>
