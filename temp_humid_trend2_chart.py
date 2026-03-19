@@ -558,20 +558,18 @@ def make_updown_vals(values: list, trends: list) -> tuple:
     return up_vals, down_vals
 
 
-def add_chart(ws, xl_app,
+def add_chart(ws,
               sheet_name: str,
               header_row: int, data_start_row: int, data_rows: int,
               time_col: int,
               val_col: int, up_col: int, dn_col: int,
               chart_title: str, chart_left: float, chart_top: float,
-              rate_col: int = -1,
+              rate_up_col: int = -1, rate_dn_col: int = -1,
               chart_width: float = 420, chart_height: float = 280):
     """
-    분산형(XY Scatter) 차트를 ws에 추가.
-    - Series 1: 시간 vs 원본값
-    - Series 2: 시간 vs UP값
-    - Series 3: 시간 vs DOWN값
-    - Series 4: (옵션) 시간 vs 분당변화량 (보조 Y축)
+    분산형(XY Scatter) + 막대 혼합 차트를 ws에 추가.
+    - 주 Y축 (XY Scatter): 원본값 / UP값 / DOWN값
+    - 보조 Y축 (막대): UP 분당변화량 / DOWN 분당변화량
     반환: chart_obj
     """
     # xlXYScatter = -4169
@@ -582,36 +580,47 @@ def add_chart(ws, xl_app,
 
     data_end = data_start_row + data_rows - 1
 
-    def add_series(name, x_col, y_col, color_rgb, marker_size=3, axis_group=1):
+    def add_scatter(name, x_col, y_col, color_rgb, marker_size=3):
         sr = chart.SeriesCollection().NewSeries()
         sr.Name = name
         sr.XValues = ws.Range(ws.Cells(data_start_row, x_col),
                               ws.Cells(data_end, x_col))
         sr.Values  = ws.Range(ws.Cells(data_start_row, y_col),
                               ws.Cells(data_end, y_col))
+        sr.ChartType             = -4169   # xlXYScatter
         sr.Format.Line.Visible   = 0
-        sr.MarkerStyle           = 2    # xlMarkerStylePlus
+        sr.MarkerStyle           = 2
         sr.MarkerSize            = marker_size
         sr.MarkerForegroundColor = color_rgb
         sr.MarkerBackgroundColor = color_rgb
-        sr.AxisGroup             = axis_group   # 1=주축, 2=보조축
+        sr.AxisGroup             = 1
 
-    # 원본 시리즈 먼저 → Y축 범위가 실제 값 기준으로 설정됨
-    add_series("원본", time_col, val_col, 0xAAAAAA, marker_size=2)
-    add_series("UP",   time_col, up_col,  0x00AA44, marker_size=4)
-    add_series("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)
-
-    # 분당변화량 시리즈 (보조 Y축)
-    if rate_col > 0:
-        add_series("변화량(분당)", time_col, rate_col,
-                   0x0066CC, marker_size=3, axis_group=2)
+    def add_bar(name, x_col, y_col, color_rgb):
+        sr = chart.SeriesCollection().NewSeries()
+        sr.Name = name
+        sr.XValues = ws.Range(ws.Cells(data_start_row, x_col),
+                              ws.Cells(data_end, x_col))
+        sr.Values  = ws.Range(ws.Cells(data_start_row, y_col),
+                              ws.Cells(data_end, y_col))
+        sr.ChartType   = 57    # xlColumnClustered
+        sr.AxisGroup   = 2     # 보조 Y축
         try:
-            chart.Axes(2, 2).HasTitle = True   # xlSecondary=2
-            chart.Axes(2, 2).AxisTitle.Text = "변화량(/min)"
+            sr.Interior.Color = color_rgb
+            sr.Format.Fill.ForeColor.RGB = color_rgb
         except Exception:
             pass
 
-    # 빈칸은 gaps 처리
+    # 주 Y축 — 분산형
+    add_scatter("원본", time_col, val_col, 0xAAAAAA, marker_size=2)
+    add_scatter("UP",   time_col, up_col,  0x00AA44, marker_size=4)
+    add_scatter("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)
+
+    # 보조 Y축 — UP/DOWN 변화량 막대
+    if rate_up_col > 0:
+        add_bar("변화량 UP",   time_col, rate_up_col, 0x44BB44)
+    if rate_dn_col > 0:
+        add_bar("변화량 DOWN", time_col, rate_dn_col, 0xFF6666)
+
     chart.DisplayBlanksAs = 0
 
     chart.HasTitle = True
@@ -620,6 +629,11 @@ def add_chart(ws, xl_app,
     chart.Axes(1).AxisTitle.Text = "시간"
     chart.Axes(2).HasTitle = True
     chart.Axes(2).AxisTitle.Text = chart_title
+    try:
+        chart.Axes(2, 2).HasTitle = True
+        chart.Axes(2, 2).AxisTitle.Text = "변화량(/min)"
+    except Exception:
+        pass
 
     return chart_obj
 
@@ -744,36 +758,34 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
         if (info["time_col"] > 0 and info["val_col_t"] > 0
                 and info["t_up_col"] > 0 and info["t_dn_col"] > 0):
             try:
-                add_chart(ws_src, None,
+                add_chart(ws_r,
                           info["sheet_name"],
                           info["header_row"], info["data_start_row"],
                           info["data_rows"],
                           info["time_col"],
                           info["val_col_t"], info["t_up_col"], info["t_dn_col"],
                           "온도", left_t, row_top,
-                          rate_col=info["t_rate_col"],
+                          rate_up_col=info.get("t_rate_up_col", -1),
+                          rate_dn_col=info.get("t_rate_dn_col", -1),
                           chart_width=CHART_W, chart_height=CHART_H)
-                co = ws_src.ChartObjects(ws_src.ChartObjects().Count)
-                co.Chart.Location(2, RESULT_NAME)
             except Exception as e:
-                llog(f"  [Result] {info['sheet_name']} 온도 차트 이동 실패: {e}")
+                llog(f"  [Result] {info['sheet_name']} 온도 차트 실패: {e}")
 
         if (info["time_col"] > 0 and info["val_col_h"] > 0
                 and info["h_up_col"] > 0 and info["h_dn_col"] > 0):
             try:
-                add_chart(ws_src, None,
+                add_chart(ws_r,
                           info["sheet_name"],
                           info["header_row"], info["data_start_row"],
                           info["data_rows"],
                           info["time_col"],
                           info["val_col_h"], info["h_up_col"], info["h_dn_col"],
                           "습도", left_h, row_top,
-                          rate_col=info["h_rate_col"],
+                          rate_up_col=info.get("h_rate_up_col", -1),
+                          rate_dn_col=info.get("h_rate_dn_col", -1),
                           chart_width=CHART_W, chart_height=CHART_H)
-                co = ws_src.ChartObjects(ws_src.ChartObjects().Count)
-                co.Chart.Location(2, RESULT_NAME)
             except Exception as e:
-                llog(f"  [Result] {info['sheet_name']} 습도 차트 이동 실패: {e}")
+                llog(f"  [Result] {info['sheet_name']} 습도 차트 실패: {e}")
 
     llog(f"  [Result] 차트 {len(sheet_chart_infos) * 2}개 추가 완료")
 
@@ -910,7 +922,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             t_trend_col = h_trend_col = -1
             t_up_col = t_dn_col = h_up_col = h_dn_col = -1
-            t_rate_col = h_rate_col = -1
+            t_rate_up_col = t_rate_dn_col = -1
+            h_rate_up_col = h_rate_dn_col = -1
             rates_t = rates_h = []
 
             if temp_vals:
@@ -923,8 +936,11 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
                 rates_t = calc_rate_per_min(temp_vals, timestamps, t_trends)
-                write_trend_col(ws, header_row, data_start_row,
-                                "Temp_Rate", rates_t)
+                write_trend_col(ws, header_row, data_start_row, "Temp_Rate", rates_t)
+                t_rate_up_vals  = [r if isinstance(r,(int,float)) and r > 0 else "" for r in rates_t]
+                t_rate_dn_vals  = [r if isinstance(r,(int,float)) and r < 0 else "" for r in rates_t]
+                write_trend_col(ws, header_row, data_start_row, "Temp_Rate_UP",   t_rate_up_vals)
+                write_trend_col(ws, header_row, data_start_row, "Temp_Rate_DOWN", t_rate_dn_vals)
                 t_up_vals, t_dn_vals = make_updown_vals(temp_vals, t_trends)
                 t_up_col = write_trend_col(ws, header_row, data_start_row,
                                            "Temp_UP", t_up_vals)
@@ -947,8 +963,11 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
                 rates_h = calc_rate_per_min(humid_vals, timestamps, h_trends)
-                write_trend_col(ws, header_row, data_start_row,
-                                "Humid_Rate", rates_h)
+                write_trend_col(ws, header_row, data_start_row, "Humid_Rate", rates_h)
+                h_rate_up_vals  = [r if isinstance(r,(int,float)) and r > 0 else "" for r in rates_h]
+                h_rate_dn_vals  = [r if isinstance(r,(int,float)) and r < 0 else "" for r in rates_h]
+                write_trend_col(ws, header_row, data_start_row, "Humid_Rate_UP",   h_rate_up_vals)
+                write_trend_col(ws, header_row, data_start_row, "Humid_Rate_DOWN", h_rate_dn_vals)
                 h_up_vals, h_dn_vals = make_updown_vals(humid_vals, h_trends)
                 h_up_col = write_trend_col(ws, header_row, data_start_row,
                                            "Humid_UP", h_up_vals)
@@ -965,8 +984,10 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             val_col_t = find_col_ws(temp_col_name)
             val_col_h = find_col_ws(humid_col_name)
 
-            t_rate_col = find_col_ws("Temp_Rate")
-            h_rate_col = find_col_ws("Humid_Rate")
+            t_rate_up_col = find_col_ws("Temp_Rate_UP")
+            t_rate_dn_col = find_col_ws("Temp_Rate_DOWN")
+            h_rate_up_col = find_col_ws("Humid_Rate_UP")
+            h_rate_dn_col = find_col_ws("Humid_Rate_DOWN")
 
             # 시트별 차트 정보 저장 (Result 시트용)
             chart_info = {
@@ -978,11 +999,13 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 "val_col_t":     val_col_t,
                 "t_up_col":      t_up_col,
                 "t_dn_col":      t_dn_col,
-                "t_rate_col":    t_rate_col,
+                "t_rate_up_col": t_rate_up_col,
+                "t_rate_dn_col": t_rate_dn_col,
                 "val_col_h":     val_col_h,
                 "h_up_col":      h_up_col,
                 "h_dn_col":      h_dn_col,
-                "h_rate_col":    h_rate_col,
+                "h_rate_up_col": h_rate_up_col,
+                "h_rate_dn_col": h_rate_dn_col,
                 "rates_t":       list(rates_t) if temp_vals else [],
                 "rates_h":       list(rates_h) if humid_vals else [],
                 "trends_t":      list(t_trends) if temp_vals else [],
@@ -993,17 +1016,19 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             sheet_chart_infos.append(chart_info)
 
             if time_axis_col > 0 and temp_vals and val_col_t > 0                     and t_up_col > 0 and t_dn_col > 0:
-                add_chart(ws, xl, sheet_name,
+                add_chart(ws, sheet_name,
                           header_row, data_start_row, data_rows,
                           time_axis_col, val_col_t, t_up_col, t_dn_col,
-                          "온도", 10, 20, rate_col=t_rate_col)
+                          "온도", 10, 20,
+                          rate_up_col=t_rate_up_col, rate_dn_col=t_rate_dn_col)
                 log(f"  [{sheet_name}] 🌡 온도 차트 추가")
 
             if time_axis_col > 0 and humid_vals and val_col_h > 0                     and h_up_col > 0 and h_dn_col > 0:
-                add_chart(ws, xl, sheet_name,
+                add_chart(ws, sheet_name,
                           header_row, data_start_row, data_rows,
                           time_axis_col, val_col_h, h_up_col, h_dn_col,
-                          "습도", 440, 20, rate_col=h_rate_col)
+                          "습도", 440, 20,
+                          rate_up_col=h_rate_up_col, rate_dn_col=h_rate_dn_col)
                 log(f"  [{sheet_name}] 💧 습도 차트 추가")
 
             if sheet_done:
