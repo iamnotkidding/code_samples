@@ -1,11 +1,5 @@
-"""
-Excel Trend Analyzer — Temperature & Humidity
-- win32com.client 단독 사용 (openpyxl 미사용)
-- 셀 색깔 / 폰트 / 정렬 없음 — 값만 기록
-- 3가지 입력 포맷 지원 (설정 파일명은 스크립트명과 동일)
-- 전체 시트 각각 독립 처리
-- 온도 / 습도 각각 독립 min_rows
-- 결과: 입력 파일에 직접 Temp_Trend / Humid_Trend 컬럼 추가 후 저장
+"""Excel Trend Analyzer — Temperature & Humidity
+win32com 기반, config.json 포맷 자동 인식, 결과 컬럼 직접 기록
 """
 
 import json
@@ -18,18 +12,14 @@ import threading
 from datetime import datetime, timedelta
 import win32com.client
 
-
 # ══════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════
-# PyInstaller exe 빌드 시 sys.frozen 이 True로 설정됨
-# exe: sys.executable 기준 경로 사용
-# .py: __file__ 기준 경로 사용
+# exe 빌드(PyInstaller)면 sys.executable, .py면 __file__ 기준
 if getattr(sys, "frozen", False):
     CONFIG_FILE = os.path.splitext(os.path.abspath(sys.executable))[0] + ".json"
 else:
     CONFIG_FILE = os.path.splitext(os.path.abspath(__file__))[0] + ".json"
-
 
 def load_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
@@ -40,66 +30,52 @@ def load_config() -> dict:
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_config(cfg: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-
 
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
 def analyze_trends(values: list,
-                   min_rows: int         = 3,
-                   max_flat_rows: int    = 2,
-                   max_noise_rows: int   = 0,
-                   min_rate_abs: float   = 0.0,
-                   max_merge_diff: float = 0.0,
-                   timestamps: list      = None) -> list:
+                   min_rows: int       = 3,
+                   min_rate_abs: float = 0.0,
+                   timestamps: list    = None) -> list:
     """
-    UP/DOWN 추세 분석 — 급격한 변화 구간 감지.
-
-    파라미터:
-      min_rows       : 유효한 UP/DOWN 최소 연속 행 수
-      max_flat_rows  : flat(동일값) 구간이 이 이하면 인접 방향으로 채움
-      max_noise_rows : 노이즈로 간주할 최대 구간 길이
-                       이 이하이면서 양쪽이 같은 방향이면 해당 방향으로 덮어씀
-      min_rate_abs   : 급격한 변화의 최소 분당 변화율 절대값
-                       이 미만이면 유효하지 않은 구간으로 제거
-      max_merge_diff : 인접한 같은 방향 구간 합칠 때 허용 변화율 차이
-                       0이면 변화율 조건 없이 무조건 합침
-
-    처리 순서:
-      Step1: 인접 값 비교 → raw 방향
-      Step2: flat 구간 채움 (max_flat_rows 이하, 수렴까지)
-      Step3: 노이즈 제거 (max_noise_rows 이하이고 양쪽 같은 방향, 수렴까지)
-      Step4: min_rows 미만 구간 제거
-      Step5: min_rate_abs 미만 구간 제거 (시간 정보 있을 때)
-      Step6: 같은 방향 구간 연결 (max_merge_diff 조건, 수렴까지)
+    UP/DOWN 추세 분석 (급격한 변화 구간 감지).
+      min_rows     : 유효 구간 최소 행 수
+      min_rate_abs : 최소 분당 변화율 (0=미적용)
+    내부 자동: max_flat_rows = max_noise_rows = min_rows-1
+    Step1 raw→ Step2 flat채움→ Step3 노이즈제거→ Step4 min_rows→ Step5 min_rate→ Step6 연결
     """
     n = len(values)
     if n == 0:
         return []
 
-    ts_len = len(timestamps) if timestamps else 0
+    max_flat_rows  = max(min_rows - 1, 0)
+    max_noise_rows = max(min_rows - 1, 0)
 
-    def get_ts(i):
-        return timestamps[i] if i < ts_len else None
+    # 타임스탬프 → 분(float) 배열로 미리 변환 (반복 참조 최적화)
+    ts_min = [None] * n
+    if timestamps:
+        ts_len = len(timestamps)
+        for i in range(ts_len if ts_len < n else n):
+            ts_min[i] = timestamps[i]
 
     def minutes_between(i, j):
-        ts_i = get_ts(i); ts_j = get_ts(j)
-        if ts_i and ts_j and ts_j != ts_i:
-            dt = (ts_j - ts_i).total_seconds() / 60.0
+        ti, tj = ts_min[i], ts_min[j]
+        if ti and tj and tj != ti:
+            dt = (tj - ti).total_seconds() / 60.0
             return dt if dt != 0 else None
         return None
 
     def seg_rate(s, e):
         if e <= s: return None
         dt = minutes_between(s, e)
-        if dt is None: return None
-        return (values[e] - values[s]) / dt
+        return (values[e] - values[s]) / dt if dt else None
 
     def get_segs(data):
+        """O(n) 구간 목록 반환"""
         segs = []; i = 0
         while i < n:
             d = data[i]; j = i
@@ -107,136 +83,92 @@ def analyze_trends(values: list,
             segs.append((i, j - 1, d)); i = j
         return segs
 
-    def build_rate_map(data):
-        rm = {}
-        for s, e, d in get_segs(data):
-            if d != 0:
-                rm[(s, e)] = seg_rate(s, e)
-        return rm
-
-    # ── Step1: raw 방향 (1=UP, -1=DOWN, 0=flat) ─────────────
+    # Step1: raw 방향 (1=UP, -1=DOWN, 0=flat)
     raw = [0] * n
     for i in range(1, n):
         if   values[i] > values[i - 1]: raw[i] =  1
         elif values[i] < values[i - 1]: raw[i] = -1
 
-    filled = raw[:]
+    filled = raw
 
-    # ── Step2: flat 구간 채움 ────────────────────────────────
+    # Step2: flat 채움 — 단일 패스로 한 방향 처리, 수렴까지 반복
+    # 한 패스에서 모든 적격 flat 구간을 채우면 O(n) per pass
     if max_flat_rows > 0:
-        outer = True
-        while outer:
-            outer = False
-            for direction in (1, -1):
-                inner = True
-                while inner:
-                    inner = False
-                    i = 0
-                    while i < n:
-                        if filled[i] != direction: i += 1; continue
-                        j = i
-                        while j < n and filled[j] == direction: j += 1
-                        k = j
-                        while k < n and filled[k] == 0: k += 1
-                        if (k < n and filled[k] == direction
-                                and (k - j) <= max_flat_rows):
-                            for idx in range(j, k): filled[idx] = direction
-                            inner = outer = True; i = k
-                        else:
-                            i = j
+        for direction in (1, -1):
+            changed = True
+            while changed:
+                changed = False
+                i = 0
+                while i < n:
+                    if filled[i] != direction: i += 1; continue
+                    j = i
+                    while j < n and filled[j] == direction: j += 1
+                    k = j
+                    while k < n and filled[k] == 0: k += 1
+                    if k < n and filled[k] == direction and (k - j) <= max_flat_rows:
+                        filled[j:k] = [direction] * (k - j)
+                        changed = True
+                        i = k
+                    else:
+                        i = j
 
-    rate_map = build_rate_map(filled)
-
-    # ── Step3: 노이즈 제거 ───────────────────────────────────
+    # Step3: 노이즈 제거 — 단일 패스로 전체 처리, 수렴까지
     if max_noise_rows > 0:
-        outer = True
-        while outer:
-            outer = False
-            for direction in (1, -1):
-                inner = True
-                while inner:
-                    inner = False
-                    segs = get_segs(filled)
-                    for si in range(1, len(segs) - 1):
-                        ls, le, ld = segs[si - 1]
-                        ms, me, md = segs[si]
-                        rs, re, rd = segs[si + 1]
-                        if ld != direction or rd != direction: continue
-                        if (me - ms + 1) <= max_noise_rows:
-                            for k in range(ms, me + 1): filled[k] = direction
-                            new_r = seg_rate(ls, re)
-                            rate_map.pop((ls, le), None)
-                            rate_map.pop((rs, re), None)
-                            rate_map[(ls, re)] = new_r
-                            inner = outer = True; break
+        for direction in (1, -1):
+            changed = True
+            while changed:
+                changed = False
+                segs = get_segs(filled)
+                for si in range(1, len(segs) - 1):
+                    ls, le, ld = segs[si - 1]
+                    ms, me, md = segs[si]
+                    rs, re, rd = segs[si + 1]
+                    if ld != direction or rd != direction: continue
+                    if (me - ms + 1) <= max_noise_rows:
+                        filled[ms:me + 1] = [direction] * (me - ms + 1)
+                        changed = True
+                        break  # segs 무효화 → 재계산
 
-        rate_map = build_rate_map(filled)
-
-    # ── Step4: min_rows 미만 구간 제거 ───────────────────────
+    # Step4: min_rows 필터 — 단일 패스
     result = [0] * n
     for s, e, d in get_segs(filled):
         if d != 0 and (e - s + 1) >= min_rows:
-            for k in range(s, e + 1): result[k] = d
-    rate_map = build_rate_map(result)
+            result[s:e + 1] = [d] * (e - s + 1)
 
-    # ── Step5: min_rate_abs 미만 구간 제거 ───────────────────
+    # Step5: min_rate_abs 필터
     if min_rate_abs > 0.0:
         changed = True
         while changed:
             changed = False
             for s, e, d in get_segs(result):
                 if d == 0: continue
-                r = rate_map.get((s, e)) or seg_rate(s, e)
-                if r is None: continue
-                if abs(r) < min_rate_abs:
-                    for k in range(s, e + 1): result[k] = 0
+                r = seg_rate(s, e)
+                if r is not None and abs(r) < min_rate_abs:
+                    result[s:e + 1] = [0] * (e - s + 1)
                     changed = True; break
-        rate_map = build_rate_map(result)
 
-    # ── Step6: 같은 방향 구간 연결 (수렴까지) ────────────────
-    outer = True
-    while outer:
-        outer = False
-        for direction in (1, -1):
-            inner = True
-            while inner:
-                inner = False
-                segs = get_segs(result)
-                for si in range(1, len(segs) - 1):
-                    ls, le, ld = segs[si - 1]
-                    ms, me, md = segs[si]
-                    rs, re, rd = segs[si + 1]
-                    if ld != direction or rd != direction: continue
-                    if md != 0: continue
-                    if max_merge_diff > 0:
-                        rl = rate_map.get((ls, le)) or seg_rate(ls, le)
-                        rr = rate_map.get((rs, re)) or seg_rate(rs, re)
-                        if (rl is not None and rr is not None
-                                and abs(rl - rr) > max_merge_diff):
-                            continue
-                    for k in range(ms, me + 1): result[k] = direction
-                    new_r = seg_rate(ls, re)
-                    rate_map.pop((ls, le), None)
-                    rate_map.pop((rs, re), None)
-                    rate_map[(ls, re)] = new_r
-                    inner = outer = True; break
-
-    build_rate_map(result)  # 최종 동기화
+    # Step6: 같은 방향 연결 — 단일 패스로 전체, 수렴까지
+    # rate_map은 max_merge_diff=0(기본)이면 불필요 → 조건부 계산
+    for direction in (1, -1):
+        changed = True
+        while changed:
+            changed = False
+            segs = get_segs(result)
+            for si in range(1, len(segs) - 1):
+                ls, le, ld = segs[si - 1]
+                ms, me, md = segs[si]
+                rs, re, rd = segs[si + 1]
+                if ld != direction or rd != direction or md != 0: continue
+                result[ms:me + 1] = [direction] * (me - ms + 1)
+                changed = True; break
 
     _MAP = {1: "UP", -1: "DOWN", 0: ""}
     return [_MAP[c] for c in result]
+
 def count_groups(trends: list, direction: str) -> int:
-    """연속된 direction 구간(그룹)의 개수를 반환"""
-    count = 0
-    in_group = False
-    for v in trends:
-        if v == direction:
-            if not in_group:
-                count += 1
-                in_group = True
-        else:
-            in_group = False
-    return count
+    """연속 direction 구간 개수"""
+    return sum(1 for i, v in enumerate(trends)
+               if v == direction and (i == 0 or trends[i-1] != direction))
 
 # ══════════════════════════════════════════════
 # 포맷 자동 인식
@@ -259,7 +191,6 @@ def detect_format(filepath: str, formats: dict) -> tuple:
     try:
         wb = xl.Workbooks.Open(os.path.abspath(filepath),
                                UpdateLinks=False, ReadOnly=True)
-        # Result 시트를 제외한 첫 번째 시트 사용
         ws = None
         for sh in wb.Sheets:
             if sh.Name != RESULT_SHEET:
@@ -270,9 +201,6 @@ def detect_format(filepath: str, formats: dict) -> tuple:
         ur = ws.UsedRange
         last_col = ur.Column + ur.Columns.Count - 1
 
-        # ── Step1: 포맷 점수 계산 ────────────────────────────────
-        # 각 포맷의 header_row 헤더를 읽어 config column 값과 매칭 점수 계산.
-        # 빈 문자열 config("") 도 점수에 포함 (빈 헤더 셀 존재 여부로 판단).
         best_key, best_score = None, -1
         fmt_headers = {}   # fmt_key → headers_orig (재사용)
 
@@ -298,11 +226,9 @@ def detect_format(filepath: str, formats: dict) -> tuple:
                 cfg_name = cfg_val.strip().lower()
 
                 if cfg_name == "":
-                    # config "" → 헤더가 빈 셀 존재하면 +1
                     if any(h == "" for h in headers_orig):
                         score += 1
                 else:
-                    # config 값 있음 → 빈 헤더 제외하고 부분 문자열 매칭
                     if any(cfg_name in h.lower() or h.lower() in cfg_name
                            for h in headers_orig if h != ""):
                         score += 1
@@ -315,8 +241,6 @@ def detect_format(filepath: str, formats: dict) -> tuple:
         if not best_key:
             best_key = next(iter(formats))
 
-        # ── Step2: 선택된 포맷으로 실제 컬럼 이름 매칭 ──────────
-        # Step1과 동일한 규칙으로 temp/humid 실제 헤더명 반환.
         fmt            = formats[best_key]
         col_map        = fmt.get("columns", {})
         headers_orig   = fmt_headers.get(best_key, [])
@@ -328,13 +252,11 @@ def detect_format(filepath: str, formats: dict) -> tuple:
             found    = None
 
             if cfg_name == "":
-                # config "" → 빈 헤더 셀인 첫 번째 열
                 for orig in headers_orig:
                     if orig == "":
                         found = ""
                         break
             else:
-                # config 값 있음 → 빈 헤더 제외하고 부분 문자열 매칭
                 for orig in headers_orig:
                     if orig == "":
                         continue
@@ -342,7 +264,7 @@ def detect_format(filepath: str, formats: dict) -> tuple:
                         found = orig
                         break
 
-            matched[role] = found   # None → 못 찾음
+            matched[role] = found
 
         return best_key, matched
     finally:
@@ -357,13 +279,9 @@ def _xl_open(filepath: str, visible=False):
     xl.Visible        = False
     xl.DisplayAlerts  = False
     xl.ScreenUpdating = False
-    wb = xl.Workbooks.Open(
-        os.path.abspath(filepath),
-        UpdateLinks=False,             # 외부 링크 갱신 안 함
-        ReadOnly=False,
-    )
+    wb = xl.Workbooks.Open(os.path.abspath(filepath),
+                           UpdateLinks=False, ReadOnly=False)
     return xl, wb
-
 
 RESULT_SHEET = "Result"
 
@@ -376,19 +294,12 @@ def get_sheet_names(filepath: str) -> list:
     finally:
         wb.Close(False); xl.Quit()
 
-
 def _excel_serial_to_dt(serial: float) -> datetime:
     """Excel serial number → datetime (1899-12-30 기준)"""
     return datetime(1899, 12, 30) + timedelta(days=serial)
 
-
 def _parse_val_to_dt(v) -> datetime:
-    """
-    단일 셀 값을 datetime으로 변환.
-    - datetime: 그대로 반환
-    - float/int: Excel serial number (날짜+시간 포함 가능)
-    - str: 여러 포맷 시도
-    """
+    """셀 값(datetime/serial/str) → datetime. 실패 시 None."""
     if v is None:
         return None
     if isinstance(v, datetime):
@@ -409,30 +320,17 @@ def _parse_val_to_dt(v) -> datetime:
                 pass
     return None
 
-
 def _parse_excel_dt(date_val, time_val):
-    """
-    날짜 열 + 시간 열 값을 합쳐 datetime 반환.
-
-    규칙:
-      1. date_val 과 time_val 이 모두 있으면:
-         - date 부분(연/월/일)과 time 부분(시/분/초) 조합
-      2. time_val 만 있으면:
-         - time_val 이 날짜 정보 포함(serial or datetime)이면 그대로
-         - 시간만 있으면 시간만 사용 (날짜 없이)
-      3. date_val 만 있으면: date_val 사용
-    """
+    """날짜열+시간열 → datetime. 둘 다 있으면 연/월/일 + 시/분/초 조합."""
     dt_date = _parse_val_to_dt(date_val)
     dt_time = _parse_val_to_dt(time_val)
 
     if dt_date and dt_time:
-        # 날짜 열의 연/월/일 + 시간 열의 시/분/초 조합
         return datetime(dt_date.year, dt_date.month, dt_date.day,
                         dt_time.hour, dt_time.minute, dt_time.second,
                         dt_time.microsecond)
 
     return dt_date or dt_time
-
 
 def read_sheet(filepath: str, sheet_name: str,
                header_row: int, data_start_row: int,
@@ -450,7 +348,6 @@ def read_sheet(filepath: str, sheet_name: str,
         last_col = ur.Column + ur.Columns.Count - 1
         last_row = ur.Row    + ur.Rows.Count    - 1
 
-        # 헤더 행 일괄 읽기
         hdr_raw = ws.Range(
             ws.Cells(header_row, 1),
             ws.Cells(header_row, last_col)
@@ -502,8 +399,6 @@ def read_sheet(filepath: str, sheet_name: str,
         temp_vals  = read_col_float(t_ci)
         humid_vals = read_col_float(h_ci)
 
-        # 타임스탬프 구성
-        # 날짜열 + 시간열 조합 / 시간열만 / 날짜열만 / 없음
         n = max(len(temp_vals), len(humid_vals))
         dates = read_col_raw(date_ci) if date_ci > 0 else []
         times = read_col_raw(time_ci) if time_ci > 0 else []
@@ -518,72 +413,33 @@ def read_sheet(filepath: str, sheet_name: str,
     finally:
         wb.Close(False); xl.Quit()
 
-
-
 def calc_rate_per_min(values: list, timestamps: list, trends: list) -> list:
-    """
-    각 그룹(연속 UP/DOWN 구간)의 분당 변화량을 계산.
-    - 그룹 내 첫 행과 마지막 행의 값/시간 차이로 계산
-    - 시간 정보가 없으면 "" (빈칸) 반환
-    - 유효하지 않은 행("")은 빈 문자열 반환
-    반환: list[float | ""]  — 각 행의 분당 변화량 (그룹 내 모든 행에 동일값)
-    """
+    """각 UP/DOWN 구간의 분당 변화량. 시간 없으면 "". 구간 내 모든 행 동일값."""
     n = len(values)
     if n == 0:
         return []
-
-    # 연속 구간 추출
-    segments = []
+    ts_n  = len(timestamps) if timestamps else 0
+    result = [""] * n
     i = 0
     while i < n:
         d = trends[i]; j = i
-        while j < n and trends[j] == d:
-            j += 1
-        segments.append((i, j - 1, d))
-        i = j
-
-    result = [""] * n
-
-    for s, e, d in segments:
-        if d not in ("UP", "DOWN"):
-            continue
-
-        v_start = values[s]
-        v_end   = values[e]
-        dv      = v_end - v_start
-
-        # 시간 차이 계산 (분 단위) — 시간 정보 없으면 빈칸
-        ts_start = timestamps[s] if timestamps and s < len(timestamps) else None
-        ts_end   = timestamps[e] if timestamps and e < len(timestamps) else None
-
-        if not ts_start or not ts_end or ts_start == ts_end:
-            # 시간 정보 없음 → rate 계산 불가
-            continue
-
-        dt_minutes = (ts_end - ts_start).total_seconds() / 60.0
-
-        if dt_minutes == 0:
-            rate = 0.0
-        else:
-            rate = round(dv / dt_minutes, 4)
-
-        for k in range(s, e + 1):
-            result[k] = rate
-
+        while j < n and trends[j] == d: j += 1
+        s, e = i, j - 1; i = j
+        if d not in ("UP", "DOWN"): continue
+        ts_s = timestamps[s] if s < ts_n else None
+        ts_e = timestamps[e] if e < ts_n else None
+        if not ts_s or not ts_e or ts_s == ts_e: continue
+        dt = (ts_e - ts_s).total_seconds() / 60.0
+        if dt == 0: continue
+        rate = round((values[e] - values[s]) / dt, 4)
+        result[s:e + 1] = [rate] * (e - s + 1)
     return result
 
-
-
 def make_updown_vals(values: list, trends: list) -> tuple:
-    """
-    UP/DOWN 값 컬럼 생성.
-    - up_vals  : trend가 UP이면 원본 값, 아니면 "" (빈칸 → 차트에서 점 미표시)
-    - down_vals: trend가 DOWN이면 원본 값, 아니면 ""
-    """
+    """UP→원본값, 아니면 "" (차트 빈칸 처리)."""
     up_vals   = [v if t == "UP"   else "" for v, t in zip(values, trends)]
     down_vals = [v if t == "DOWN" else "" for v, t in zip(values, trends)]
     return up_vals, down_vals
-
 
 def add_chart(ws,
               sheet_name: str,
@@ -709,8 +565,6 @@ def add_chart(ws,
 
     return chart_obj
 
-
-
 def _extract_groups(values: list, trends: list, rates: list, direction: str) -> list:
     """
     direction(UP/DOWN) 구간 그룹 목록 반환.
@@ -737,7 +591,6 @@ def _extract_groups(values: list, trends: list, rates: list, direction: str) -> 
         else:
             i += 1
     return groups
-
 
 def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
     """
@@ -870,7 +723,6 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
     # 이미 ws_r.Cells에 데이터가 기록됐으므로 차트가 위에 겹쳐도 OK
     llog(f"  [Result] 차트 {chart_count}개 추가 완료")
 
-
 def write_trend_col(ws, header_row: int, data_start_row: int,
                     col_name: str, trends: list):
     """결과 컬럼을 값만 기록 (대용량 최적화: Range 일괄 쓰기)
@@ -918,7 +770,6 @@ def write_trend_col(ws, header_row: int, data_start_row: int,
             ws.Cells(data_start_row + len(trends) - 1, col)
         ).Value = data_2d
     return col   # 기록된 절대 열 번호 반환
-
 
 # ══════════════════════════════════════════════
 # 전체 파일 처리
@@ -1147,7 +998,6 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
     return filepath, processed
 
-
 # ══════════════════════════════════════════════
 # GUI: 포맷 편집 다이얼로그
 # ══════════════════════════════════════════════
@@ -1218,7 +1068,6 @@ class FormatEditorDialog(tk.Toplevel):
             return
         self.destroy()
 
-
 # ══════════════════════════════════════════════
 # GUI: 센서 설정 프레임
 # ══════════════════════════════════════════════
@@ -1244,7 +1093,6 @@ class SensorConfigFrame(tk.LabelFrame):
     def get(self):
         return {"min_rows":     int(self.min_rows_var.get()),
                 "min_rate_abs": float(self.min_rate_abs_var.get())}
-
 
 # ══════════════════════════════════════════════
 # GUI: 시트 행
@@ -1283,7 +1131,6 @@ class SheetRow:
         self._result_var.set("")
 
     def get(self): return {"enabled": self.enabled.get()}
-
 
 # ══════════════════════════════════════════════
 # GUI: 메인 앱
@@ -1655,7 +1502,6 @@ class App(tk.Tk):
         self.log_box.tag_configure("error", foreground="#F38BA8")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
-
 
 # ══════════════════════════════════════════════
 if __name__ == "__main__":
