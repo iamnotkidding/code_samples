@@ -1057,11 +1057,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 "temp_vals":     list(temp_vals),
                 "humid_vals":    list(humid_vals),
             }
-            chart_info["t_cfg_text"] = t_cfg_text if temp_vals else ""
-            chart_info["h_cfg_text"] = h_cfg_text if humid_vals else ""
-            sheet_chart_infos.append(chart_info)
 
-            # config 설정 텍스트 (텍스트박스용)
+            # config 설정 텍스트 — chart_info 저장 전에 생성
             def _cfg_text(cfg):
                 return (
                     f"fill:   {cfg.get('fill_rows',0)}\n"
@@ -1072,6 +1069,10 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 )
             t_cfg_text = _cfg_text(t_cfg)
             h_cfg_text = _cfg_text(h_cfg)
+
+            chart_info["t_cfg_text"] = t_cfg_text if temp_vals else ""
+            chart_info["h_cfg_text"] = h_cfg_text if humid_vals else ""
+            sheet_chart_infos.append(chart_info)
 
             if time_axis_col > 0 and temp_vals and val_col_t > 0                     and t_up_col > 0 and t_dn_col > 0:
                 add_chart(ws, sheet_name,
@@ -1201,15 +1202,16 @@ class SensorConfigFrame(tk.LabelFrame):
         self.normal_rate_diff_var = tk.StringVar(value=str(init.get("normal_rate_diff", 0.0)))
         self.min_rate_abs_var     = tk.StringVar(value=str(init.get("min_rate_abs",     0.0)))
         for i, (lbl, var) in enumerate([
-            ("fill_rows        (flat 허용 연속 행)",       self.fill_rows_var),
-            ("normal_rows      (노이즈 연결 최대 행)",     self.normal_rows_var),
-            ("normal_rate_diff (연결 허용 변화율 차이)",   self.normal_rate_diff_var),
-            ("min_rows         (UP/DOWN 최소 연속 행)",    self.min_rows_var),
-            ("min_rate_abs     (최소 평균 변화율 절대값)", self.min_rate_abs_var),
+            ("fill_rows",        self.fill_rows_var),
+            ("normal_rows",      self.normal_rows_var),
+            ("normal_rate_diff", self.normal_rate_diff_var),
+            ("min_rows",         self.min_rows_var),
+            ("min_rate_abs",     self.min_rate_abs_var),
         ]):
-            tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg).grid(
+            tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
+                     anchor="e", width=16).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
-            tk.Entry(self, textvariable=var, width=10,
+            tk.Entry(self, textvariable=var, width=8,
                      bg=ebg, fg=fg, insertbackground=fg,
                      relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
@@ -1276,8 +1278,8 @@ class App(tk.Tk):
         self.title("Trend Analyzer — Temperature & Humidity")
         self.configure(bg=self.BG)
         self.resizable(True, False)
-        self.geometry("900x700")
-        self.minsize(700, 400)
+        self.geometry("1100x720")
+        self.minsize(900, 450)
         try:
             self.config_data = load_config()
         except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -1389,7 +1391,7 @@ class App(tk.Tk):
         tk.Button(self, text="▶  전체 시트 분석 실행",
                   bg=self.BBG, fg=self.BFG,
                   font=("Segoe UI", 11, "bold"), relief="flat", cursor="hand2",
-                  command=self._run).pack(pady=(0, 6), ipadx=20, ipady=4)
+                  command=self._run).pack(fill="x", padx=P, pady=(0, 6), ipady=6)
 
         self.log_box = tk.Text(self, height=8, bg="#181825", fg="#BAC2DE",
                                font=("Consolas", 9), relief="flat", state="disabled")
