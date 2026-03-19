@@ -1,3 +1,4 @@
+
 """
 Excel Trend Analyzer — Temperature & Humidity
 - win32com.client 단독 사용 (openpyxl 미사용)
@@ -49,22 +50,33 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 # 추세 분석
 # ══════════════════════════════════════════════
-def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
-                   max_normal_rows: int = 0,
-                   max_normal_rate_diff: float = 0.0,
-                   min_rate_abs: float = 0.0,
-                   timestamps: list = None) -> list:
+def analyze_trends(values: list,
+                   min_rows: int         = 3,
+                   max_flat_rows: int    = 2,
+                   max_noise_rows: int   = 0,
+                   min_rate_abs: float   = 0.0,
+                   max_merge_diff: float = 0.0,
+                   timestamps: list      = None) -> list:
     """
-    UP/DOWN 추세 분석.
+    UP/DOWN 추세 분석 — 급격한 변화 구간 감지.
 
-    Step1: 인접 값 비교 → raw 방향 (정수 코드 1/−1/0)
-    Step2: fill_rows  — 같은 방향 사이 flat 채움 (수렴까지)
-           ※ 채울 때마다 합쳐진 구간의 변화량 재계산
-    Step3: normalize  — outer 사이 inner 연결 (수렴까지)
-           ※ 합칠 때마다 즉시 변화량 재계산 → 다음 비교에 반영
-    Step4: min_rows   — 짧은 구간 제거, 재계산
-    Step5: min_rate_abs — 변화율 작은 구간 제거, 재계산
-    Step6: 남은 연속 UP/UP, DOWN/DOWN 연결, 재계산
+    파라미터:
+      min_rows       : 유효한 UP/DOWN 최소 연속 행 수
+      max_flat_rows  : flat(동일값) 구간이 이 이하면 인접 방향으로 채움
+      max_noise_rows : 노이즈로 간주할 최대 구간 길이
+                       이 이하이면서 양쪽이 같은 방향이면 해당 방향으로 덮어씀
+      min_rate_abs   : 급격한 변화의 최소 분당 변화율 절대값
+                       이 미만이면 유효하지 않은 구간으로 제거
+      max_merge_diff : 인접한 같은 방향 구간 합칠 때 허용 변화율 차이
+                       0이면 변화율 조건 없이 무조건 합침
+
+    처리 순서:
+      Step1: 인접 값 비교 → raw 방향
+      Step2: flat 구간 채움 (max_flat_rows 이하, 수렴까지)
+      Step3: 노이즈 제거 (max_noise_rows 이하이고 양쪽 같은 방향, 수렴까지)
+      Step4: min_rows 미만 구간 제거
+      Step5: min_rate_abs 미만 구간 제거 (시간 정보 있을 때)
+      Step6: 같은 방향 구간 연결 (max_merge_diff 조건, 수렴까지)
     """
     n = len(values)
     if n == 0:
@@ -75,37 +87,27 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
     def get_ts(i):
         return timestamps[i] if i < ts_len else None
 
-    def minutes_between(i, j) -> float:
-        """인덱스 i~j 사이 시간(분). 없으면 None."""
-        ts_i = get_ts(i)
-        ts_j = get_ts(j)
+    def minutes_between(i, j):
+        ts_i = get_ts(i); ts_j = get_ts(j)
         if ts_i and ts_j and ts_j != ts_i:
             dt = (ts_j - ts_i).total_seconds() / 60.0
             return dt if dt != 0 else None
         return None
 
     def seg_rate(s, e):
-        """구간 [s, e]의 분당 변화율. 시간 없으면 None."""
-        if e <= s:
-            return None
+        if e <= s: return None
         dt = minutes_between(s, e)
-        if dt is None:
-            return None
+        if dt is None: return None
         return (values[e] - values[s]) / dt
 
-    # ── 구간 목록 추출 ───────────────────────────────────────
     def get_segs(data):
-        segs = []
-        i = 0
+        segs = []; i = 0
         while i < n:
             d = data[i]; j = i
             while j < n and data[j] == d: j += 1
-            segs.append((i, j - 1, d))
-            i = j
+            segs.append((i, j - 1, d)); i = j
         return segs
 
-    # ── 구간별 rate 딕셔너리 계산 ───────────────────────────
-    # key=(s,e) → rate(float|None)
     def build_rate_map(data):
         rm = {}
         for s, e, d in get_segs(data):
@@ -113,145 +115,117 @@ def analyze_trends(values: list, min_rows: int, max_fill_rows: int,
                 rm[(s, e)] = seg_rate(s, e)
         return rm
 
-    # ── Step1: raw 방향 ─────────────────────────────────────
+    # ── Step1: raw 방향 (1=UP, -1=DOWN, 0=flat) ─────────────
     raw = [0] * n
     for i in range(1, n):
         if   values[i] > values[i - 1]: raw[i] =  1
         elif values[i] < values[i - 1]: raw[i] = -1
 
-    # ── Step2: fill_rows (수렴까지, 합칠 때마다 rate 재계산) ─
     filled = raw[:]
-    if max_fill_rows > 0:
-        outer_changed = True
-        while outer_changed:
-            outer_changed = False
+
+    # ── Step2: flat 구간 채움 ────────────────────────────────
+    if max_flat_rows > 0:
+        outer = True
+        while outer:
+            outer = False
             for direction in (1, -1):
-                inner_changed = True
-                while inner_changed:
-                    inner_changed = False
+                inner = True
+                while inner:
+                    inner = False
                     i = 0
                     while i < n:
-                        if filled[i] != direction:
-                            i += 1; continue
+                        if filled[i] != direction: i += 1; continue
                         j = i
                         while j < n and filled[j] == direction: j += 1
                         k = j
                         while k < n and filled[k] == 0: k += 1
-                        flat_len = k - j
-                        if k < n and filled[k] == direction and flat_len <= max_fill_rows:
+                        if (k < n and filled[k] == direction
+                                and (k - j) <= max_flat_rows):
                             for idx in range(j, k): filled[idx] = direction
-                            # 합쳐진 구간 [i .. k-1+...] rate 재계산은
-                            # build_rate_map 호출 시 자동 반영
-                            inner_changed = True
-                            outer_changed = True
-                            i = k
+                            inner = outer = True; i = k
                         else:
                             i = j
 
-    # Step2 완료 후 rate 맵 생성
     rate_map = build_rate_map(filled)
 
-    # ── Step3: normalize (수렴까지, 합칠 때마다 rate 재계산) ─
-    if max_normal_rows > 0 or max_normal_rate_diff > 0:
-        outer_changed = True
-        while outer_changed:
-            outer_changed = False
+    # ── Step3: 노이즈 제거 ───────────────────────────────────
+    if max_noise_rows > 0:
+        outer = True
+        while outer:
+            outer = False
             for direction in (1, -1):
-                inner_changed = True
-                while inner_changed:
-                    inner_changed = False
+                inner = True
+                while inner:
+                    inner = False
                     segs = get_segs(filled)
                     for si in range(1, len(segs) - 1):
                         ls, le, ld = segs[si - 1]
                         ms, me, md = segs[si]
                         rs, re, rd = segs[si + 1]
+                        if ld != direction or rd != direction: continue
+                        if (me - ms + 1) <= max_noise_rows:
+                            for k in range(ms, me + 1): filled[k] = direction
+                            new_r = seg_rate(ls, re)
+                            rate_map.pop((ls, le), None)
+                            rate_map.pop((rs, re), None)
+                            rate_map[(ls, re)] = new_r
+                            inner = outer = True; break
 
-                        if ld != direction or rd != direction:
-                            continue
-
-                        mid_len = me - ms + 1
-                        cond_rows = (max_normal_rows > 0 and mid_len < max_normal_rows)
-                        cond_rate = False
-                        if max_normal_rate_diff > 0:
-                            rl = rate_map.get((ls, le))
-                            rr = rate_map.get((rs, re))
-                            if rl is None: rl = seg_rate(ls, le)
-                            if rr is None: rr = seg_rate(rs, re)
-                            if rl is not None and rr is not None:
-                                cond_rate = abs(rl - rr) <= max_normal_rate_diff
-
-                        if not (cond_rows or cond_rate):
-                            continue
-
-                        # 합치기
-                        for k in range(ms, me + 1): filled[k] = direction
-                        # 합쳐진 구간 [ls .. re] rate 즉시 재계산
-                        new_rate = seg_rate(ls, re)
-                        # 기존 좌우 키 제거, 새 합쳐진 구간 키 등록
-                        rate_map.pop((ls, le), None)
-                        rate_map.pop((rs, re), None)
-                        rate_map[(ls, re)] = new_rate
-
-                        inner_changed = True
-                        outer_changed = True
-                        break   # 구간 목록 재계산
-
-        # Step3 후 rate_map 전체 재계산 (합쳐진 구간 정합)
         rate_map = build_rate_map(filled)
 
-    # ── Step4: min_rows 미만 → 0, rate_map 재계산 ───────────
-    result_code = [0] * n
+    # ── Step4: min_rows 미만 구간 제거 ───────────────────────
+    result = [0] * n
     for s, e, d in get_segs(filled):
         if d != 0 and (e - s + 1) >= min_rows:
-            for k in range(s, e + 1):
-                result_code[k] = d
-    rate_map = build_rate_map(result_code)
+            for k in range(s, e + 1): result[k] = d
+    rate_map = build_rate_map(result)
 
-    # ── Step5: min_rate_abs 미만 → 0, rate_map 재계산 ───────
+    # ── Step5: min_rate_abs 미만 구간 제거 ───────────────────
     if min_rate_abs > 0.0:
         changed = True
         while changed:
             changed = False
-            for s, e, d in get_segs(result_code):
-                if d == 0:
-                    continue
-                r = rate_map.get((s, e))
-                if r is None:
-                    r = seg_rate(s, e)
-                if r is None:
-                    continue
+            for s, e, d in get_segs(result):
+                if d == 0: continue
+                r = rate_map.get((s, e)) or seg_rate(s, e)
+                if r is None: continue
                 if abs(r) < min_rate_abs:
-                    for k in range(s, e + 1): result_code[k] = 0
-                    changed = True
-                    break   # 구간 목록 재계산
-        rate_map = build_rate_map(result_code)
+                    for k in range(s, e + 1): result[k] = 0
+                    changed = True; break
+        rate_map = build_rate_map(result)
 
-    # ── Step6: 연속 UP/DOWN 연결, rate_map 재계산 ───────────
-    for direction in (1, -1):
-        changed = True
-        while changed:
-            changed = False
-            i = 0
-            while i < n:
-                if result_code[i] != direction:
-                    i += 1; continue
-                j = i
-                while j < n and result_code[j] == direction: j += 1
-                k = j
-                while k < n and result_code[k] == 0: k += 1
-                if k < n and result_code[k] == direction:
-                    for idx in range(j, k): result_code[idx] = direction
-                    changed = True
-                    i = k
-                else:
-                    i = j
-    rate_map = build_rate_map(result_code)   # 최종 rate_map 동기화
+    # ── Step6: 같은 방향 구간 연결 (수렴까지) ────────────────
+    outer = True
+    while outer:
+        outer = False
+        for direction in (1, -1):
+            inner = True
+            while inner:
+                inner = False
+                segs = get_segs(result)
+                for si in range(1, len(segs) - 1):
+                    ls, le, ld = segs[si - 1]
+                    ms, me, md = segs[si]
+                    rs, re, rd = segs[si + 1]
+                    if ld != direction or rd != direction: continue
+                    if md != 0: continue
+                    if max_merge_diff > 0:
+                        rl = rate_map.get((ls, le)) or seg_rate(ls, le)
+                        rr = rate_map.get((rs, re)) or seg_rate(rs, re)
+                        if (rl is not None and rr is not None
+                                and abs(rl - rr) > max_merge_diff):
+                            continue
+                    for k in range(ms, me + 1): result[k] = direction
+                    new_r = seg_rate(ls, re)
+                    rate_map.pop((ls, le), None)
+                    rate_map.pop((rs, re), None)
+                    rate_map[(ls, re)] = new_r
+                    inner = outer = True; break
 
-    # ── 정수 코드 → 문자열 변환 ─────────────────────────────
+    build_rate_map(result)  # 최종 동기화
+
     _MAP = {1: "UP", -1: "DOWN", 0: ""}
-    return [_MAP[c] for c in result_code]
-
-
+    return [_MAP[c] for c in result]
 def count_groups(trends: list, direction: str) -> int:
     """연속된 direction 구간(그룹)의 개수를 반환"""
     count = 0
@@ -1036,10 +1010,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if temp_vals:
                 t_trends = analyze_trends(temp_vals,
-                                          int(t_cfg["min_rows"]),
-                                          int(t_cfg["max_fill_rows"]),
-                                          int(t_cfg.get("max_normal_rows", 0)),
-                                          float(t_cfg.get("max_normal_rate_diff", 0.0)),
+                                          int(t_cfg.get("min_rows", 3)),
                                           float(t_cfg.get("min_rate_abs", 0.0)),
                                           timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
@@ -1064,10 +1035,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if humid_vals:
                 h_trends = analyze_trends(humid_vals,
-                                          int(h_cfg["min_rows"]),
-                                          int(h_cfg["max_fill_rows"]),
-                                          int(h_cfg.get("max_normal_rows", 0)),
-                                          float(h_cfg.get("max_normal_rate_diff", 0.0)),
+                                          int(h_cfg.get("min_rows", 3)),
                                           float(h_cfg.get("min_rate_abs", 0.0)),
                                           timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
@@ -1126,12 +1094,11 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             # config 설정 텍스트 — chart_info 저장 전에 생성
             def _cfg_text(cfg):
+                mr = cfg.get('min_rows', 3)
                 return (
-                    f"fill:   {cfg.get('max_fill_rows',0)}\n"
-                    f"normal: {cfg.get('max_normal_rows',0)}"
-                    f"  diff:{cfg.get('max_normal_rate_diff',0)}\n"
-                    f"min:    {cfg.get('min_rows',0)}"
-                    f"  rate:{cfg.get('min_rate_abs',0)}"
+                    f"min_rows:     {mr}\n"
+                    f"  (flat/noise: {max(mr-1,0)})\n"
+                    f"min_rate_abs: {cfg.get('min_rate_abs', 0.0)}"
                 )
             t_cfg_text = _cfg_text(t_cfg)
             h_cfg_text = _cfg_text(h_cfg)
@@ -1262,31 +1229,22 @@ class SensorConfigFrame(tk.LabelFrame):
                          bg=bg, fg=fg, bd=1, relief="groove",
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
-        self.min_rows_var         = tk.StringVar(value=str(init.get("min_rows",         3)))
-        self.max_fill_rows_var        = tk.StringVar(value=str(init.get("max_fill_rows",        1)))
-        self.max_normal_rows_var      = tk.StringVar(value=str(init.get("max_normal_rows",      0)))
-        self.max_normal_rate_diff_var = tk.StringVar(value=str(init.get("max_normal_rate_diff", 0.0)))
-        self.min_rate_abs_var     = tk.StringVar(value=str(init.get("min_rate_abs",     0.0)))
+        self.min_rows_var     = tk.StringVar(value=str(init.get("min_rows",     3)))
+        self.min_rate_abs_var = tk.StringVar(value=str(init.get("min_rate_abs", 0.0)))
         for i, (lbl, var) in enumerate([
-            ("max_fill_rows",        self.max_fill_rows_var),
-            ("max_normal_rows",      self.max_normal_rows_var),
-            ("max_normal_rate_diff", self.max_normal_rate_diff_var),
-            ("min_rows",         self.min_rows_var),
-            ("min_rate_abs",     self.min_rate_abs_var),
+            ("min_rows     (유효 구간 최소 행)", self.min_rows_var),
+            ("min_rate_abs (최소 분당 변화율)",  self.min_rate_abs_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
-                     anchor="e", width=16).grid(
+                     anchor="e", width=22).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
             tk.Entry(self, textvariable=var, width=8,
                      bg=ebg, fg=fg, insertbackground=fg,
                      relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"max_fill_rows":        int(self.max_fill_rows_var.get()),
-                "max_normal_rows":      int(self.max_normal_rows_var.get()),
-                "max_normal_rate_diff": float(self.max_normal_rate_diff_var.get()),
-                "min_rows":         int(self.min_rows_var.get()),
-                "min_rate_abs":     float(self.min_rate_abs_var.get())}
+        return {"min_rows":     int(self.min_rows_var.get()),
+                "min_rate_abs": float(self.min_rate_abs_var.get())}
 
 
 # ══════════════════════════════════════════════
@@ -1614,10 +1572,10 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}, max_fill_rows={cfg['temp']['max_fill_rows']}, "
-                f"max_normal_rows={cfg['temp']['max_normal_rows']}, max_normal_rate_diff={cfg['temp']['max_normal_rate_diff']}\n"
-                f"  💧 humid: min_rows={cfg['humid']['min_rows']}, max_fill_rows={cfg['humid']['max_fill_rows']}, "
-                f"max_normal_rows={cfg['humid']['max_normal_rows']}, max_normal_rate_diff={cfg['humid']['max_normal_rate_diff']}")
+                f"  🌡 temp : min_rows={cfg['temp']['min_rows']}  "
+                f"min_rate_abs={cfg['temp']['min_rate_abs']}\n"
+                f"  💧 humid: min_rows={cfg['humid']['min_rows']}  "
+                f"min_rate_abs={cfg['humid']['min_rate_abs']}")
         except ValueError:
             messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
