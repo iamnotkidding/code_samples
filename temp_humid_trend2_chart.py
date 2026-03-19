@@ -62,11 +62,10 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
       Step2: fill_rows 처리 (UP/DOWN 각 2회)
              같은 방향 구간 사이 flat("") 이 fill_rows 이하면 채움
 
-      Step3: normal_rows 처리
-             UP 구간 사이에 끼인 DOWN/flat 구간이
-               - normal_rows 미만이고
-               - normal_rate_diff > 0 이면:
-                 양쪽 UP 구간의 평균 변화율 차이가 normal_rate_diff 이내일 때만 연결
+      Step3: normal_rows / normal_rate_diff 처리 (OR 조건)
+             UP 구간 사이에 끼인 DOWN/flat 구간이 다음 중 하나를 만족하면 연결
+               - (normal_rows > 0) AND inner 길이 < normal_rows
+               - (normal_rate_diff > 0) AND 양쪽 변화율 차이 <= normal_rate_diff
              → UP/DOWN 각 2회 반복
 
       Step4: min_rows 처리 (fill + normal 완료 후 적용)
@@ -121,14 +120,13 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
 
     def normalize_between(outer: str, data: list) -> list:
         """
-        outer 구간 사이에 끼인 구간(inner)이 다음 조건을 모두 만족하면
-        outer 로 덮어써서 연결한다.
-          - inner 길이 < normal_rows
-          - normal_rate_diff > 0 이면:
-            left 구간과 right 구간의 평균 변화율 차이 <= normal_rate_diff
+        outer 구간 사이에 끼인 구간(inner)이 다음 조건 중 하나를 만족하면
+        outer 로 덮어써서 연결한다. (OR 조건)
+          - (normal_rows > 0) AND inner 길이 < normal_rows
+          - (normal_rate_diff > 0) AND 양쪽 변화율 차이 <= normal_rate_diff
         inner는 "" 또는 outer 반대 방향 모두 대상.
         """
-        if normal_rows <= 0:
+        if normal_rows <= 0 and normal_rate_diff <= 0:
             return data[:]
         result = data[:]
 
@@ -153,15 +151,16 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
 
                 mid_len = mid[1] - mid[0] + 1
 
-                if mid_len >= normal_rows:
-                    continue
-
-                # normal_rate_diff 조건 검사
+                # OR 조건: 둘 중 하나 만족하면 연결
+                cond_rows = (normal_rows > 0 and mid_len < normal_rows)
+                cond_rate = False
                 if normal_rate_diff > 0:
                     r_left  = seg_rate(left)
                     r_right = seg_rate(right)
-                    if abs(r_left - r_right) > normal_rate_diff:
-                        continue   # 변화율 차이가 너무 크면 연결 안 함
+                    cond_rate = (abs(r_left - r_right) <= normal_rate_diff)
+
+                if not (cond_rows or cond_rate):
+                    continue
 
                 for k in range(mid[0], mid[1] + 1):
                     result[k] = outer
@@ -170,7 +169,7 @@ def analyze_trends(values: list, min_rows: int, fill_rows: int,
 
         return result
 
-    if normal_rows > 0:
+    if normal_rows > 0 or normal_rate_diff > 0:
         filled = normalize_between("UP",   filled)
         filled = normalize_between("DOWN", filled)
         filled = normalize_between("UP",   filled)
@@ -577,62 +576,53 @@ def add_chart(ws,
               chart_title: str, chart_left: float, chart_top: float,
               rate_up_col: int = -1, rate_dn_col: int = -1,
               chart_width: float = 420, chart_height: float = 280,
-              config_text: str = ""):
+              config_text: str = "",
+              src_ws=None):
     """
-    분산형(XY Scatter) + 막대 혼합 차트를 ws에 추가.
-    - 주 Y축 (XY Scatter): 원본값 / UP값 / DOWN값
-    - 보조 Y축 (막대): UP 분당변화량 / DOWN 분당변화량
+    XY Scatter 차트를 ws에 추가.
+    - 주 Y축: 원본값 / UP값 / DOWN값  (XY Scatter)
+    - 보조 Y축: UP/DOWN 변화량  (XY Scatter, 보조축)
+    src_ws: 데이터가 있는 시트 (None이면 ws 자신)
     반환: chart_obj
     """
-    # xlXYScatter = -4169
-    chart_obj = ws.ChartObjects().Add(chart_left, chart_top,
-                                      chart_width, chart_height)
-    chart     = chart_obj.Chart
-    chart.ChartType = -4169   # xlXYScatter
-
+    data_ws  = src_ws if src_ws is not None else ws
     data_end = data_start_row + data_rows - 1
 
-    def add_scatter(name, x_col, y_col, color_rgb, marker_size=3):
+    chart_obj = ws.ChartObjects().Add(chart_left, chart_top,
+                                      chart_width, chart_height)
+    chart = chart_obj.Chart
+    chart.ChartType = -4169   # xlXYScatter
+
+    def rng(col):
+        return data_ws.Range(data_ws.Cells(data_start_row, col),
+                             data_ws.Cells(data_end, col))
+
+    def add_scatter(name, x_col, y_col, color_rgb, marker_size=3, axis_group=1):
         sr = chart.SeriesCollection().NewSeries()
-        sr.Name = name
-        sr.XValues = ws.Range(ws.Cells(data_start_row, x_col),
-                              ws.Cells(data_end, x_col))
-        sr.Values  = ws.Range(ws.Cells(data_start_row, y_col),
-                              ws.Cells(data_end, y_col))
-        sr.ChartType             = -4169   # xlXYScatter
+        sr.Name      = name
+        sr.XValues   = rng(x_col)
+        sr.Values    = rng(y_col)
+        sr.ChartType             = -4169
         sr.Format.Line.Visible   = 0
         sr.MarkerStyle           = 2
         sr.MarkerSize            = marker_size
         sr.MarkerForegroundColor = color_rgb
         sr.MarkerBackgroundColor = color_rgb
-        sr.AxisGroup             = 1
+        sr.AxisGroup             = axis_group
 
-    def add_bar(name, x_col, y_col, color_rgb):
-        sr = chart.SeriesCollection().NewSeries()
-        sr.Name = name
-        sr.XValues = ws.Range(ws.Cells(data_start_row, x_col),
-                              ws.Cells(data_end, x_col))
-        sr.Values  = ws.Range(ws.Cells(data_start_row, y_col),
-                              ws.Cells(data_end, y_col))
-        sr.ChartType   = 57    # xlColumnClustered
-        sr.AxisGroup   = 2     # 보조 Y축
-        try:
-            sr.Interior.Color = color_rgb
-            sr.Format.Fill.ForeColor.RGB = color_rgb
-        except Exception:
-            pass
-
-    # 주 Y축 — 분산형
+    # 주 Y축
     add_scatter("원본", time_col, val_col, 0xAAAAAA, marker_size=2)
     add_scatter("UP",   time_col, up_col,  0x00AA44, marker_size=4)
     add_scatter("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)
 
-    # 보조 Y축 — UP/DOWN 변화량 막대
+    # 보조 Y축 — 변화량 (XY Scatter, axis_group=2)
     has_rate = (rate_up_col > 0 or rate_dn_col > 0)
     if rate_up_col > 0:
-        add_bar("변화량 UP",   time_col, rate_up_col, 0x44BB44)
+        add_scatter("변화량 UP",   time_col, rate_up_col,
+                    0x44BB44, marker_size=3, axis_group=2)
     if rate_dn_col > 0:
-        add_bar("변화량 DOWN", time_col, rate_dn_col, 0xFF6666)
+        add_scatter("변화량 DOWN", time_col, rate_dn_col,
+                    0xFF6666, marker_size=3, axis_group=2)
 
     chart.DisplayBlanksAs = 0
 
@@ -643,37 +633,37 @@ def add_chart(ws,
     chart.Axes(2).HasTitle = True
     chart.Axes(2).AxisTitle.Text = chart_title
 
-    # 보조 Y축 범위: 변화량이 그래프 하단에만 오도록
-    # 주 Y축 범위를 먼저 얻어서 보조 Y축 최대값을 주 Y축 범위의 2~3배로 설정
+    # 보조 Y축: 변화량이 하단에만 오도록 범위 설정
     if has_rate:
         try:
-            ax2 = chart.Axes(2, 2)   # xlSecondary=2
-            ax2.HasTitle = True
-            ax2.AxisTitle.Text = "변화량(/min)"
-            # 보조 Y축 최대값 = 주 Y축 범위 * 3 (막대가 하단 1/3 영역에만 표시)
-            ax_main = chart.Axes(2)
-            main_max = ax_main.MaximumScale
-            main_min = ax_main.MinimumScale
-            main_range = main_max - main_min if main_max != main_min else 1.0
-            ax2.MaximumScale =  main_range * 3
-            ax2.MinimumScale = -main_range * 3
+            ax_main = chart.Axes(2)           # 주 Y축
+            ax_sec  = chart.Axes(2, 2)        # 보조 Y축 (xlSecondary=2)
+            main_range = (ax_main.MaximumScale - ax_main.MinimumScale) or 1.0
+            ax_sec.HasTitle = True
+            ax_sec.AxisTitle.Text = "변화량(/min)"
+            ax_sec.MaximumScale =  main_range * 3
+            ax_sec.MinimumScale = -main_range * 3
         except Exception:
             pass
 
-    # ── config 설정 텍스트 박스 ──────────────────────────────
+    # ── config 텍스트박스 + 차트 그룹화 ──────────────────────
     if config_text:
         try:
+            TB_W, TB_H = 155, 75
             tb = ws.Shapes.AddTextbox(
-                1,                          # msoTextOrientationHorizontal
-                chart_obj.Left + chart_width - 160,
-                chart_obj.Top + 4,
-                155, 80)
+                1,
+                chart_obj.Left + chart_width - TB_W - 2,
+                chart_obj.Top + 2,
+                TB_W, TB_H)
             tb.TextFrame.Characters().Text = config_text
-            tb.TextFrame.Characters().Font.Size = 7
-            tb.TextFrame.Characters().Font.Name = "Consolas"
-            tb.Fill.Visible = True
-            tb.Fill.ForeColor.RGB = 0xF0F0F0
-            tb.Line.Visible = True
+            tb.TextFrame.Characters().Font.Size  = 7
+            tb.TextFrame.Characters().Font.Name  = "Consolas"
+            tb.Fill.Visible          = True
+            tb.Fill.ForeColor.RGB    = 0xF5F5F5
+            tb.Line.Visible          = True
+            tb.Line.ForeColor.RGB    = 0x999999
+            # 차트 + 텍스트박스를 하나의 그룹으로 묶기
+            ws.Shapes.Range([chart_obj.Name, tb.Name]).Group()
         except Exception:
             pass
 
@@ -781,11 +771,12 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
     ws_r.Columns("A:F").AutoFit()
     llog(f"  [Result] 변화량 테이블 작성 완료 (총 {table_last_row - 1}행)")
 
-    # ── 차트를 Result 시트에 추가 ────────────────────────────
+    # ── 차트를 Result 시트 위쪽에 추가 (테이블 위) ──────────
     CHART_W = 420; CHART_H = 280
-    # 테이블 높이 추정 (행당 약 15pt) + 여백
-    chart_top_start = table_last_row * 15 + 30
+    GAP     = 10
+    chart_top_start = 5   # 시트 최상단부터 차트 배치
 
+    chart_count = 0
     for si, info in enumerate(sheet_chart_infos):
         ws_src = None
         try:
@@ -793,9 +784,9 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
         except Exception:
             continue
 
-        row_top = chart_top_start + si * (CHART_H + 10)
+        row_top = chart_top_start + si * (CHART_H + GAP)
         left_t  = 5
-        left_h  = left_t + CHART_W + 10
+        left_h  = left_t + CHART_W + GAP
 
         if (info["time_col"] > 0 and info["val_col_t"] > 0
                 and info["t_up_col"] > 0 and info["t_dn_col"] > 0):
@@ -810,7 +801,9 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
                           rate_up_col=info.get("t_rate_up_col", -1),
                           rate_dn_col=info.get("t_rate_dn_col", -1),
                           chart_width=CHART_W, chart_height=CHART_H,
-                          config_text=info.get("t_cfg_text", ""))
+                          config_text=info.get("t_cfg_text", ""),
+                          src_ws=ws_src)
+                chart_count += 1
             except Exception as e:
                 llog(f"  [Result] {info['sheet_name']} 온도 차트 실패: {e}")
 
@@ -827,11 +820,15 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
                           rate_up_col=info.get("h_rate_up_col", -1),
                           rate_dn_col=info.get("h_rate_dn_col", -1),
                           chart_width=CHART_W, chart_height=CHART_H,
-                          config_text=info.get("h_cfg_text", ""))
+                          config_text=info.get("h_cfg_text", ""),
+                          src_ws=ws_src)
+                chart_count += 1
             except Exception as e:
                 llog(f"  [Result] {info['sheet_name']} 습도 차트 실패: {e}")
 
-    llog(f"  [Result] 차트 {len(sheet_chart_infos) * 2}개 추가 완료")
+    # 테이블을 차트 아래에 배치 (차트가 시트를 덮지 않도록 행 위치 조정)
+    # 이미 ws_r.Cells에 데이터가 기록됐으므로 차트가 위에 겹쳐도 OK
+    llog(f"  [Result] 차트 {chart_count}개 추가 완료")
 
 
 def write_trend_col(ws, header_row: int, data_start_row: int,
@@ -1080,7 +1077,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                           time_axis_col, val_col_t, t_up_col, t_dn_col,
                           "온도", 10, 20,
                           rate_up_col=t_rate_up_col, rate_dn_col=t_rate_dn_col,
-                          config_text=t_cfg_text)
+                          config_text=t_cfg_text, src_ws=ws)
                 log(f"  [{sheet_name}] 🌡 온도 차트 추가")
 
             if time_axis_col > 0 and humid_vals and val_col_h > 0                     and h_up_col > 0 and h_dn_col > 0:
@@ -1089,7 +1086,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                           time_axis_col, val_col_h, h_up_col, h_dn_col,
                           "습도", 440, 20,
                           rate_up_col=h_rate_up_col, rate_dn_col=h_rate_dn_col,
-                          config_text=h_cfg_text)
+                          config_text=h_cfg_text, src_ws=ws)
                 log(f"  [{sheet_name}] 💧 습도 차트 추가")
 
             if sheet_done:
