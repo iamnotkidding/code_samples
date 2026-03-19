@@ -248,7 +248,14 @@ def detect_format(filepath: str, formats: dict) -> tuple:
     try:
         wb = xl.Workbooks.Open(os.path.abspath(filepath),
                                UpdateLinks=False, ReadOnly=True)
-        ws = wb.Sheets(1)
+        # Result 시트를 제외한 첫 번째 시트 사용
+        ws = None
+        for sh in wb.Sheets:
+            if sh.Name != RESULT_SHEET:
+                ws = sh
+                break
+        if ws is None:
+            ws = wb.Sheets(1)
         ur = ws.UsedRange
         last_col = ur.Column + ur.Columns.Count - 1
 
@@ -347,10 +354,14 @@ def _xl_open(filepath: str, visible=False):
     return xl, wb
 
 
+RESULT_SHEET = "Result"
+
 def get_sheet_names(filepath: str) -> list:
+    """Result 시트는 자동 생성 시트이므로 목록에서 제외"""
     xl, wb = _xl_open(filepath)
     try:
-        return [sh.Name for sh in wb.Sheets]
+        names = [sh.Name for sh in wb.Sheets if sh.Name != RESULT_SHEET]
+        return names
     finally:
         wb.Close(False); xl.Quit()
 
@@ -565,7 +576,8 @@ def add_chart(ws,
               val_col: int, up_col: int, dn_col: int,
               chart_title: str, chart_left: float, chart_top: float,
               rate_up_col: int = -1, rate_dn_col: int = -1,
-              chart_width: float = 420, chart_height: float = 280):
+              chart_width: float = 420, chart_height: float = 280,
+              config_text: str = ""):
     """
     분산형(XY Scatter) + 막대 혼합 차트를 ws에 추가.
     - 주 Y축 (XY Scatter): 원본값 / UP값 / DOWN값
@@ -616,6 +628,7 @@ def add_chart(ws,
     add_scatter("DOWN", time_col, dn_col,  0xCC2222, marker_size=4)
 
     # 보조 Y축 — UP/DOWN 변화량 막대
+    has_rate = (rate_up_col > 0 or rate_dn_col > 0)
     if rate_up_col > 0:
         add_bar("변화량 UP",   time_col, rate_up_col, 0x44BB44)
     if rate_dn_col > 0:
@@ -629,11 +642,40 @@ def add_chart(ws,
     chart.Axes(1).AxisTitle.Text = "시간"
     chart.Axes(2).HasTitle = True
     chart.Axes(2).AxisTitle.Text = chart_title
-    try:
-        chart.Axes(2, 2).HasTitle = True
-        chart.Axes(2, 2).AxisTitle.Text = "변화량(/min)"
-    except Exception:
-        pass
+
+    # 보조 Y축 범위: 변화량이 그래프 하단에만 오도록
+    # 주 Y축 범위를 먼저 얻어서 보조 Y축 최대값을 주 Y축 범위의 2~3배로 설정
+    if has_rate:
+        try:
+            ax2 = chart.Axes(2, 2)   # xlSecondary=2
+            ax2.HasTitle = True
+            ax2.AxisTitle.Text = "변화량(/min)"
+            # 보조 Y축 최대값 = 주 Y축 범위 * 3 (막대가 하단 1/3 영역에만 표시)
+            ax_main = chart.Axes(2)
+            main_max = ax_main.MaximumScale
+            main_min = ax_main.MinimumScale
+            main_range = main_max - main_min if main_max != main_min else 1.0
+            ax2.MaximumScale =  main_range * 3
+            ax2.MinimumScale = -main_range * 3
+        except Exception:
+            pass
+
+    # ── config 설정 텍스트 박스 ──────────────────────────────
+    if config_text:
+        try:
+            tb = ws.Shapes.AddTextbox(
+                1,                          # msoTextOrientationHorizontal
+                chart_obj.Left + chart_width - 160,
+                chart_obj.Top + 4,
+                155, 80)
+            tb.TextFrame.Characters().Text = config_text
+            tb.TextFrame.Characters().Font.Size = 7
+            tb.TextFrame.Characters().Font.Name = "Consolas"
+            tb.Fill.Visible = True
+            tb.Fill.ForeColor.RGB = 0xF0F0F0
+            tb.Line.Visible = True
+        except Exception:
+            pass
 
     return chart_obj
 
@@ -767,7 +809,8 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
                           "온도", left_t, row_top,
                           rate_up_col=info.get("t_rate_up_col", -1),
                           rate_dn_col=info.get("t_rate_dn_col", -1),
-                          chart_width=CHART_W, chart_height=CHART_H)
+                          chart_width=CHART_W, chart_height=CHART_H,
+                          config_text=info.get("t_cfg_text", ""))
             except Exception as e:
                 llog(f"  [Result] {info['sheet_name']} 온도 차트 실패: {e}")
 
@@ -783,7 +826,8 @@ def _build_result_sheet(wb, sheet_chart_infos: list, log=None):
                           "습도", left_h, row_top,
                           rate_up_col=info.get("h_rate_up_col", -1),
                           rate_dn_col=info.get("h_rate_dn_col", -1),
-                          chart_width=CHART_W, chart_height=CHART_H)
+                          chart_width=CHART_W, chart_height=CHART_H,
+                          config_text=info.get("h_cfg_text", ""))
             except Exception as e:
                 llog(f"  [Result] {info['sheet_name']} 습도 차트 실패: {e}")
 
@@ -1013,14 +1057,29 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 "temp_vals":     list(temp_vals),
                 "humid_vals":    list(humid_vals),
             }
+            chart_info["t_cfg_text"] = t_cfg_text if temp_vals else ""
+            chart_info["h_cfg_text"] = h_cfg_text if humid_vals else ""
             sheet_chart_infos.append(chart_info)
+
+            # config 설정 텍스트 (텍스트박스용)
+            def _cfg_text(cfg):
+                return (
+                    f"fill:   {cfg.get('fill_rows',0)}\n"
+                    f"normal: {cfg.get('normal_rows',0)}"
+                    f"  diff:{cfg.get('normal_rate_diff',0)}\n"
+                    f"min:    {cfg.get('min_rows',0)}"
+                    f"  rate:{cfg.get('min_rate_abs',0)}"
+                )
+            t_cfg_text = _cfg_text(t_cfg)
+            h_cfg_text = _cfg_text(h_cfg)
 
             if time_axis_col > 0 and temp_vals and val_col_t > 0                     and t_up_col > 0 and t_dn_col > 0:
                 add_chart(ws, sheet_name,
                           header_row, data_start_row, data_rows,
                           time_axis_col, val_col_t, t_up_col, t_dn_col,
                           "온도", 10, 20,
-                          rate_up_col=t_rate_up_col, rate_dn_col=t_rate_dn_col)
+                          rate_up_col=t_rate_up_col, rate_dn_col=t_rate_dn_col,
+                          config_text=t_cfg_text)
                 log(f"  [{sheet_name}] 🌡 온도 차트 추가")
 
             if time_axis_col > 0 and humid_vals and val_col_h > 0                     and h_up_col > 0 and h_dn_col > 0:
@@ -1028,7 +1087,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                           header_row, data_start_row, data_rows,
                           time_axis_col, val_col_h, h_up_col, h_dn_col,
                           "습도", 440, 20,
-                          rate_up_col=h_rate_up_col, rate_dn_col=h_rate_dn_col)
+                          rate_up_col=h_rate_up_col, rate_dn_col=h_rate_dn_col,
+                          config_text=h_cfg_text)
                 log(f"  [{sheet_name}] 💧 습도 차트 추가")
 
             if sheet_done:
@@ -1437,7 +1497,11 @@ class App(tk.Tk):
         for i, sname in enumerate(names):
             sr = SheetRow(self.sf, sname, self.BG, self.FG, self.LF, i)
             self._sheet_rows.append(sr)
-        self._log(f"로드 완료: {len(names)}개 시트 — " + ", ".join(names))
+        skipped = [n for n in names if n == "Result"]
+        shown   = [n for n in names if n != "Result"]
+        self._log(f"로드 완료: {len(shown)}개 시트 — " + ", ".join(shown))
+        if skipped:
+            self._log(f"  ('{', '.join(skipped)}' 시트는 자동 생성 시트로 제외됨)")
         try:
             fmt = self.config_data["formats"][detected]
             self.fmt_info_var.set(
