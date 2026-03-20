@@ -39,6 +39,7 @@ def save_config(cfg: dict):
 # ══════════════════════════════════════════════
 def analyze_trends(values: list,
                    noise_rate: float  = 0.0,
+                   merge_rate: float  = 0.0,
                    min_rows: int      = 3,
                    timestamps: list   = None) -> list:
     """
@@ -49,11 +50,14 @@ def analyze_trends(values: list,
     Step2: 노이즈 제거 — |분당변화량| < noise_rate 인 구간 FLAT으로 처리
            noise_rate=0 이면 미적용
     Step3: 같은 방향 그룹 합치기 (수렴까지)
-           두 그룹 사이 스팬이 모두 FLAT(0)이면 흡수하여 연결
+           사이 스팬이 모두 FLAT이고
+           두 그룹의 분당 변화량 차이 <= merge_rate 이면 연결
+           merge_rate=0 이면 변화량 조건 없이 FLAT 스팬만 조건으로 연결
     Step4: 최종 길이 필터 — 길이 < min_rows 인 그룹 제거
 
     파라미터:
       noise_rate : 노이즈 기준 최소 분당 변화율 (0=미적용)
+      merge_rate : 그룹 합치기 허용 분당 변화량 차이 (0=무조건 합침)
       min_rows   : 최종 유효 그룹 최소 행 수
     """
     n = len(values)
@@ -102,7 +106,14 @@ def analyze_trends(values: list,
                     work[s:e + 1] = [0] * (e - s + 1)
                     changed = True; break
 
-    # Step3: 같은 방향 합치기 (사이 스팬이 모두 FLAT이면 흡수, 수렴까지)
+    # Step3: 같은 방향 합치기 (수렴까지)
+    # 조건: 사이 스팬이 모두 FLAT  AND  두 그룹 분당 변화량 차이 <= merge_rate
+    def grp_rate(s, e):
+        """구간 [s..e] 분당 변화율. 시간 없으면 None."""
+        dt = minutes_between(s, e)
+        if dt is None or dt == 0: return None
+        return (values[e] - values[s]) / dt
+
     for direction in (1, -1):
         changed = True
         while changed:
@@ -112,12 +123,20 @@ def analyze_trends(values: list,
             for k in range(len(dir_idxs) - 1):
                 li = dir_idxs[k]
                 ri = dir_idxs[k + 1]
+                ls, le, _ = segs[li]
+                rs, re, _ = segs[ri]
                 span = segs[li + 1: ri]
                 if not span: continue
-                if all(d == 0 for _, _, d in span):
-                    ss, se = span[0][0], span[-1][1]
-                    work[ss:se + 1] = [direction] * (se - ss + 1)
-                    changed = True; break
+                if not all(d == 0 for _, _, d in span): continue
+                # 변화량 차이 조건
+                if merge_rate > 0.0:
+                    rl = grp_rate(ls, le)
+                    rr = grp_rate(rs, re)
+                    if rl is not None and rr is not None:
+                        if abs(rl - rr) > merge_rate: continue
+                ss, se = span[0][0], span[-1][1]
+                work[ss:se + 1] = [direction] * (se - ss + 1)
+                changed = True; break
 
     # Step4: 최종 길이 필터
     final = [0] * n
@@ -816,6 +835,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if temp_vals:
                 t_trends = analyze_trends(temp_vals,
                                           float(t_cfg.get("noise_rate", 0.0)),
+                                          float(t_cfg.get("merge_rate", 0.0)),
                                           int(t_cfg.get("min_rows",   3)),
                                           timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
@@ -841,6 +861,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             if humid_vals:
                 h_trends = analyze_trends(humid_vals,
                                           float(h_cfg.get("noise_rate", 0.0)),
+                                          float(h_cfg.get("merge_rate", 0.0)),
                                           int(h_cfg.get("min_rows",   3)),
                                           timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
@@ -905,6 +926,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             def _cfg_text(cfg):
                 return (
                     f"noise_rate: {cfg.get('noise_rate',0.0)}\n"
+                    f"merge_rate: {cfg.get('merge_rate',0.0)}\n"
                     f"min_rows:   {cfg.get('min_rows',3)}"
                 )
             t_cfg_text = _cfg_text(t_cfg)
@@ -1037,10 +1059,12 @@ class SensorConfigFrame(tk.LabelFrame):
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
         self.noise_rate_var = tk.StringVar(value=str(init.get("noise_rate", 0.0)))
+        self.merge_rate_var = tk.StringVar(value=str(init.get("merge_rate", 0.0)))
         self.min_rows_var   = tk.StringVar(value=str(init.get("min_rows",   3)))
         for i, (lbl, var) in enumerate([
-            ("noise_rate (노이즈 기준 분당 변화율)", self.noise_rate_var),
-            ("min_rows   (최종 최소 행)",           self.min_rows_var),
+            ("noise_rate (노이즈 기준 변화율)", self.noise_rate_var),
+            ("merge_rate (합치기 변화율 차이)", self.merge_rate_var),
+            ("min_rows   (최종 최소 행)",       self.min_rows_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
                      anchor="e", width=24).grid(
@@ -1051,6 +1075,7 @@ class SensorConfigFrame(tk.LabelFrame):
 
     def get(self):
         return {"noise_rate": float(self.noise_rate_var.get()),
+                "merge_rate": float(self.merge_rate_var.get()),
                 "min_rows":   int(self.min_rows_var.get())}
 
 # ══════════════════════════════════════════════
@@ -1364,6 +1389,11 @@ class App(tk.Tk):
             self.fmt_info_var.set("(인식 실패)")
             self._log_error(f"포맷 인식 실패: {e}")
 
+        # 시트 1개이면 자동 분석 실행
+        if len(names) == 1:
+            self._log("시트 1개 감지 → 자동 분석 시작")
+            self.after(100, self._run)
+
     def _on_load_error(self, err):
         self._set_running(False)
         messagebox.showerror("오류", f"파일 읽기 실패:\n{err}")
@@ -1377,8 +1407,8 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : noise_rate={cfg['temp']['noise_rate']}  min_rows={cfg['temp']['min_rows']}\n"
-                f"  💧 humid: noise_rate={cfg['humid']['noise_rate']}  min_rows={cfg['humid']['min_rows']}")
+                f"  🌡 temp : noise_rate={cfg['temp']['noise_rate']}  merge_rate={cfg['temp']['merge_rate']}  min_rows={cfg['temp']['min_rows']}\n"
+                f"  💧 humid: noise_rate={cfg['humid']['noise_rate']}  merge_rate={cfg['humid']['merge_rate']}  min_rows={cfg['humid']['min_rows']}")
         except ValueError:
             messagebox.showerror("오류", "min_rows는 정수로 입력하세요.")
 
