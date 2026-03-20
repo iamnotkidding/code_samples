@@ -38,33 +38,23 @@ def save_config(cfg: dict):
 # 추세 분석
 # ══════════════════════════════════════════════
 def analyze_trends(values: list,
-                   noise_max_rows: int       = 0,
-                   merge_max_rate_delta: float = 0.0,
-                   merge_max_bwn_rows: int   = 0,
-                   final_min_rows: int       = 3,
-                   final_min_rate: float     = 0.0,
-                   timestamps: list          = None) -> list:
+                   min_rate: float    = 0.0,
+                   final_min_rows: int = 3,
+                   timestamps: list   = None) -> list:
     """
-    UP/DOWN 추세 분석.
+    UP/DOWN 그룹 감지 — 피크/밸리 기반 경계 결정.
 
-    Step1: 인접 값 비교 → UP/DOWN/FLAT 분류
-           첫 행은 두 번째 행 방향 계승
-    Step2: 노이즈 흡수 (noise_max_rows > 0 일 때)
-           UP-UP 사이 DOWN/FLAT 구간, DOWN-DOWN 사이 UP/FLAT 구간이
-           noise_max_rows 이하이면 해당 방향으로 흡수, 변화량 재계산
-    Step3: 같은 방향 그룹 합치기 (수렴까지)
-           사이 스팬이 모두 FLAT이고
-           ② merge_max_bwn_rows > 0 이면 스팬 길이 <= merge_max_bwn_rows
-           ③ merge_max_rate_delta > 0 이면 두 그룹 분당 변화율 차이 <= merge_max_rate_delta
-           합칠 때마다 분당 변화량 재계산
-    Step4: 최종 필터 — 길이 < final_min_rows 이거나 |분당변화율| < final_min_rate 인 그룹 제거
+    DOWN 그룹:
+      시작: 직전 FLAT 구간의 최고값 행 (하강 시작 직전 피크)
+      끝  : 하강 후 분당 변화량 >= +min_rate 로 반전되기 직전의 최저값 행
+
+    UP 그룹:
+      시작: DOWN 끝 이후 첫 번째 rate >= +min_rate 행
+      끝  : 연속 rate >= +min_rate 구간의 마지막 행
 
     파라미터:
-      noise_max_rows     : 노이즈 흡수 최대 구간 길이 (0=미적용)
-      merge_max_rate_delta : 합치기 허용 분당 변화율 차이 (0=무조건 합침)
-      merge_max_bwn_rows : 합치기 허용 사이 스팬 최대 행 수 (0=무제한)
-      final_min_rows     : 최종 유효 그룹 최소 행 수
-      final_min_rate     : 최종 유효 그룹 최소 분당 변화율 (0=미적용)
+      min_rate      : 유효 변화로 인정하는 최소 분당 변화율
+      final_min_rows: 최종 유효 그룹 최소 행 수
     """
     n = len(values)
     if n == 0:
@@ -72,119 +62,83 @@ def analyze_trends(values: list,
 
     ts_n = len(timestamps) if timestamps else 0
 
-    def minutes_between(i, j):
-        if i < ts_n and j < ts_n:
-            ti, tj = timestamps[i], timestamps[j]
+    def get_rate(i):
+        if i == 0: return 0.0
+        dv = values[i] - values[i - 1]
+        if i < ts_n and i - 1 < ts_n:
+            ti, tj = timestamps[i - 1], timestamps[i]
             if ti and tj and tj != ti:
                 dt = (tj - ti).total_seconds() / 60.0
-                return dt if dt != 0 else None
-        return None
+                return dv / dt if dt != 0 else 0.0
+        return float(dv)
 
-    def grp_rate(s, e):
-        """구간 [s..e] 분당 변화율. 시간 없으면 None."""
-        dt = minutes_between(s, e)
-        if dt is None or dt == 0: return None
-        return (values[e] - values[s]) / dt
+    rates = [get_rate(i) for i in range(n)]
+    result = [0] * n
 
-    def get_segs(data):
-        segs = []; i = 0
-        while i < n:
-            d = data[i]; j = i
-            while j < n and data[j] == d: j += 1
-            segs.append((i, j - 1, d)); i = j
-        return segs
+    i = 0
+    while i < n:
+        # DOWN 시작 탐지: rate <= -min_rate
+        if rates[i] <= -min_rate:
+            # DOWN 시작: 현재 행(i) 직전 FLAT/안정 구간의 최고값 행
+            j = i - 1
+            while j > 0 and abs(rates[j]) < min_rate:
+                j -= 1
+            # j+1 ~ i-1 사이에서 최고값 행 탐색
+            search_start = j + 1 if j >= 0 else 0
+            search_end   = i      # i-1까지 (i 포함 시 하강 행 포함되므로)
+            if search_start < search_end:
+                peak_idx = max(range(search_start, search_end),
+                               key=lambda x: values[x])
+            else:
+                peak_idx = i - 1 if i > 0 else 0
 
-    # Step1: UP/DOWN/FLAT 분류 (1=UP, -1=DOWN, 0=FLAT)
-    raw = [0] * n
-    for i in range(1, n):
-        dv = values[i] - values[i - 1]
-        if   dv > 0: raw[i] =  1
-        elif dv < 0: raw[i] = -1
-    if n >= 2:
-        raw[0] = raw[1]
+            # DOWN 활성 구간 끝 탐색: rate <= -min_rate 연속
+            k = i
+            while k < n and rates[k] <= -min_rate:
+                k += 1
+            # k = 활성 하강 종료 직후
 
-    work = raw[:]
+            # 밸리 탐색: k 이후 rate >= +min_rate 가 나오기 전까지 최저값
+            valley_idx = k - 1
+            m = k
+            while m < n and rates[m] < min_rate:
+                if values[m] < values[valley_idx]:
+                    valley_idx = m
+                m += 1
 
-    # Step2: 노이즈 흡수
-    # 같은 방향 두 그룹 사이에 끼인 반대 방향/FLAT 구간이
-    # noise_max_rows 이하이면 해당 방향으로 덮어씀
-    if noise_max_rows > 0:
-        for direction in (1, -1):
-            changed = True
-            while changed:
-                changed = False
-                segs = get_segs(work)
-                dir_idxs = [i for i, (s, e, d) in enumerate(segs) if d == direction]
-                for k in range(len(dir_idxs) - 1):
-                    li = dir_idxs[k]
-                    ri = dir_idxs[k + 1]
-                    span = segs[li + 1: ri]
-                    if not span: continue
-                    span_len = span[-1][1] - span[0][0] + 1
-                    if span_len <= noise_max_rows:
-                        ss, se = span[0][0], span[-1][1]
-                        work[ss:se + 1] = [direction] * span_len
-                        changed = True; break
+            down_start = peak_idx
+            down_end   = valley_idx
 
-    # Step3: 같은 방향 합치기 (수렴까지, 합칠 때마다 rate 재계산)
-    # 조건: ① 사이 스팬이 모두 FLAT
-    #       ② merge_max_bwn_rows > 0 이면 스팬 길이 <= merge_max_bwn_rows
-    #       ③ merge_max_rate_delta > 0 이면 두 그룹 분당 변화율 차이 <= merge_max_rate_delta
-    # rate_cache: (s,e) → rate, 합칠 때 무효화
-    rate_cache = {}
+            if down_end > down_start and (down_end - down_start + 1) >= final_min_rows:
+                for idx in range(down_start, down_end + 1):
+                    result[idx] = -1
 
-    def cached_rate(s, e):
-        k = (s, e)
-        if k not in rate_cache:
-            rate_cache[k] = grp_rate(s, e)
-        return rate_cache[k]
+            # UP 탐지: down_end 이후 첫 번째 rate >= +min_rate 행 탐색
+            p = down_end + 1
+            while p < n and rates[p] < min_rate:
+                p += 1
+            # p = UP 시작 (rate >= min_rate 첫 행)
 
-    for direction in (1, -1):
-        changed = True
-        while changed:
-            changed = False
-            segs = get_segs(work)
-            dir_idxs = [i for i, (s, e, d) in enumerate(segs) if d == direction]
-            for k in range(len(dir_idxs) - 1):
-                li = dir_idxs[k]
-                ri = dir_idxs[k + 1]
-                ls, le, _ = segs[li]
-                rs, re, _ = segs[ri]
-                span = segs[li + 1: ri]
-                if not span: continue
-                # ① 사이 스팬 모두 FLAT
-                if not all(d == 0 for _, _, d in span): continue
-                # ② 스팬 길이 조건
-                span_len = span[-1][1] - span[0][0] + 1
-                if merge_max_bwn_rows > 0 and span_len > merge_max_bwn_rows: continue
-                # ③ 변화율 차이 조건
-                if merge_max_rate_delta > 0.0:
-                    rl = cached_rate(ls, le)
-                    rr = cached_rate(rs, re)
-                    if rl is not None and rr is not None:
-                        if abs(rl - rr) > merge_max_rate_delta: continue
-                # 합치기 + rate 재계산
-                ss, se = span[0][0], span[-1][1]
-                work[ss:se + 1] = [direction] * span_len
-                # 합쳐진 구간 캐시 무효화 후 재계산
-                rate_cache.pop((ls, le), None)
-                rate_cache.pop((rs, re), None)
-                rate_cache[(ls, re)] = grp_rate(ls, re)
-                changed = True; break
+            if p < n and rates[p] >= min_rate:
+                up_start = p
+                up_end   = p
+                while p < n and rates[p] >= min_rate:
+                    up_end = p
+                    p += 1
 
-    # Step4: 최종 필터 (길이 AND 변화율)
-    final = [0] * n
-    for s, e, d in get_segs(work):
-        if d == 0: continue
-        if (e - s + 1) < final_min_rows: continue
-        if final_min_rate > 0.0:
-            dt = minutes_between(s, e)
-            if dt is not None and abs(values[e] - values[s]) / dt < final_min_rate:
-                continue
-        final[s:e + 1] = [d] * (e - s + 1)
+                if (up_end - up_start + 1) >= final_min_rows:
+                    for idx in range(up_start, up_end + 1):
+                        result[idx] = 1
+
+                i = up_end + 1
+            else:
+                i = down_end + 1
+        else:
+            i += 1
 
     _MAP = {1: "UP", -1: "DOWN", 0: ""}
-    return [_MAP[c] for c in final]
+    return [_MAP[c] for c in result]
+
 
 def count_groups(trends: list, direction: str) -> int:
     """연속 direction 구간 개수"""
@@ -872,11 +826,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if temp_vals:
                 t_trends = analyze_trends(temp_vals,
-                                          int(t_cfg.get("noise_max_rows",      0)),
-                                          float(t_cfg.get("merge_max_rate_delta", 0.0)),
-                                          int(t_cfg.get("merge_max_bwn_rows",   0)),
-                                          int(t_cfg.get("final_min_rows",       3)),
-                                          float(t_cfg.get("final_min_rate",     0.0)),
+                                          float(t_cfg.get("min_rate",       0.0)),
+                                          int(t_cfg.get("final_min_rows",  3)),
                                           timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
@@ -900,11 +851,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             if humid_vals:
                 h_trends = analyze_trends(humid_vals,
-                                          int(h_cfg.get("noise_max_rows",      0)),
-                                          float(h_cfg.get("merge_max_rate_delta", 0.0)),
-                                          int(h_cfg.get("merge_max_bwn_rows",   0)),
-                                          int(h_cfg.get("final_min_rows",       3)),
-                                          float(h_cfg.get("final_min_rate",     0.0)),
+                                          float(h_cfg.get("min_rate",       0.0)),
+                                          int(h_cfg.get("final_min_rows",  3)),
                                           timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
@@ -967,9 +915,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             # config 설정 텍스트 — chart_info 저장 전에 생성
             def _cfg_text(cfg):
                 return (
-                    f"noise: {cfg.get('noise_max_rows',0)}\n"
-                    f"merge: delta={cfg.get('merge_max_rate_delta',0.0)}  bwn={cfg.get('merge_max_bwn_rows',0)}\n"
-                    f"final: rows={cfg.get('final_min_rows',3)}  rate={cfg.get('final_min_rate',0.0)}"
+                    f"min_rate:       {cfg.get('min_rate',0.0)}\n"
+                    f"final_min_rows: {cfg.get('final_min_rows',3)}"
                 )
             t_cfg_text = _cfg_text(t_cfg)
             h_cfg_text = _cfg_text(h_cfg)
@@ -1100,31 +1047,22 @@ class SensorConfigFrame(tk.LabelFrame):
                          bg=bg, fg=fg, bd=1, relief="groove",
                          labelanchor="nw", padx=8, pady=6)
         self.configure(background=bg)
-        self.noise_max_rows_var      = tk.StringVar(value=str(init.get("noise_max_rows",      0)))
-        self.merge_max_rate_delta_var = tk.StringVar(value=str(init.get("merge_max_rate_delta", 0.0)))
-        self.merge_max_bwn_rows_var  = tk.StringVar(value=str(init.get("merge_max_bwn_rows",  0)))
-        self.final_min_rows_var      = tk.StringVar(value=str(init.get("final_min_rows",      3)))
-        self.final_min_rate_var      = tk.StringVar(value=str(init.get("final_min_rate",      0.0)))
+        self.min_rate_var       = tk.StringVar(value=str(init.get("min_rate",       0.0)))
+        self.final_min_rows_var = tk.StringVar(value=str(init.get("final_min_rows", 3)))
         for i, (lbl, var) in enumerate([
-            ("noise_max_rows       (노이즈 흡수 최대 행)",   self.noise_max_rows_var),
-            ("merge_max_rate_delta (합치기 변화율 차이)",    self.merge_max_rate_delta_var),
-            ("merge_max_bwn_rows   (합치기 최대 스팬 행)",   self.merge_max_bwn_rows_var),
-            ("final_min_rows       (최종 최소 행)",          self.final_min_rows_var),
-            ("final_min_rate       (최종 최소 변화율)",      self.final_min_rate_var),
+            ("min_rate       (유효 분당 변화율 기준)", self.min_rate_var),
+            ("final_min_rows (최종 최소 행)",          self.final_min_rows_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
-                     anchor="e", width=28).grid(
+                     anchor="e", width=26).grid(
                 row=i, column=0, sticky="e", padx=(0, 6), pady=3)
             tk.Entry(self, textvariable=var, width=8,
                      bg=ebg, fg=fg, insertbackground=fg,
                      relief="flat").grid(row=i, column=1, sticky="w", pady=3)
 
     def get(self):
-        return {"noise_max_rows":       int(self.noise_max_rows_var.get()),
-                "merge_max_rate_delta": float(self.merge_max_rate_delta_var.get()),
-                "merge_max_bwn_rows":   int(self.merge_max_bwn_rows_var.get()),
-                "final_min_rows":       int(self.final_min_rows_var.get()),
-                "final_min_rate":       float(self.final_min_rate_var.get())}
+        return {"min_rate":       float(self.min_rate_var.get()),
+                "final_min_rows": int(self.final_min_rows_var.get())}
 
 # ══════════════════════════════════════════════
 # GUI: 시트 행
@@ -1455,8 +1393,8 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : noise={cfg['temp']['noise_max_rows']} delta={cfg['temp']['merge_max_rate_delta']} bwn={cfg['temp']['merge_max_bwn_rows']} rows={cfg['temp']['final_min_rows']} rate={cfg['temp']['final_min_rate']}\n"
-                f"  💧 humid: noise={cfg['humid']['noise_max_rows']} delta={cfg['humid']['merge_max_rate_delta']} bwn={cfg['humid']['merge_max_bwn_rows']} rows={cfg['humid']['final_min_rows']} rate={cfg['humid']['final_min_rate']}")
+                f"  🌡 temp : min_rate={cfg['temp']['min_rate']}  final_min_rows={cfg['temp']['final_min_rows']}\n"
+                f"  💧 humid: min_rate={cfg['humid']['min_rate']}  final_min_rows={cfg['humid']['final_min_rows']}")
         except ValueError:
             messagebox.showerror("오류", "final_min_rows는 정수로 입력하세요.")
 
