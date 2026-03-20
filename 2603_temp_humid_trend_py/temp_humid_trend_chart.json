@@ -36,10 +36,12 @@
 
   "temp": {
     "min_rows":     3,
-    "min_rate_abs": 0.0
+    "min_rate_abs": 0.0,
+    "min_delta":    0.0
   },
   "humid": {
     "min_rows":     3,
-    "min_rate_abs": 0.0
+    "min_rate_abs": 0.0,
+    "min_delta":    0.0
   }
 }
