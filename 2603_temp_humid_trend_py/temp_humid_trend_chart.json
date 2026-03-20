@@ -36,11 +36,15 @@
   "temp": {
     "min_rate": 0.0,
     "lookahead_rows": 3,
-    "noise_max_rows": 0
+    "noise_max_rows": 0,
+    "start_tolerance": 0.0,
+    "ignore_vals": []
   },
   "humid": {
     "min_rate": 0.0,
     "lookahead_rows": 3,
-    "noise_max_rows": 0
+    "noise_max_rows": 0,
+    "start_tolerance": 0.0,
+    "ignore_vals": []
   }
 }
