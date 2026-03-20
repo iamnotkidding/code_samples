@@ -16,6 +16,12 @@
       "columns": {"index":"","time":"시각","temp":"TEMP","humid":"HUMI"}
     }
   },
-  "temp":  {"min_rows": 3, "min_delta": 0.0},
-  "humid": {"min_rows": 3, "min_delta": 0.0}
+  "temp": {
+    "noise_rate": 0.0,
+    "min_rows":   3
+  },
+  "humid": {
+    "noise_rate": 0.0,
+    "min_rows":   3
+  }
 }
