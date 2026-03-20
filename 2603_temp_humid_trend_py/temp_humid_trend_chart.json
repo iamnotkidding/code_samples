@@ -34,16 +34,16 @@
     }
   },
   "temp": {
-    "noise_rate": 0.0,
-    "merge_rate_delta": 0.0,
-    "merge_min_bwn_rows": 0,
+    "noise_max_rows": 0,
+    "merge_max_rate_delta": 0.0,
+    "merge_max_bwn_rows": 0,
     "final_min_rows": 3,
     "final_min_rate": 0.0
   },
   "humid": {
-    "noise_rate": 0.0,
-    "merge_rate_delta": 0.0,
-    "merge_min_bwn_rows": 0,
+    "noise_max_rows": 0,
+    "merge_max_rate_delta": 0.0,
+    "merge_max_bwn_rows": 0,
     "final_min_rows": 3,
     "final_min_rate": 0.0
   }
