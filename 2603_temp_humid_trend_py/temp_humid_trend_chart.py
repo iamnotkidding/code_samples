@@ -78,12 +78,9 @@ def analyze_trends(values: list,
         return []
 
     ts_n = len(timestamps) if timestamps else 0
-    # 기준값: 앞 100행 / 중간 100행 / 끝 100행 중 최고값
+    # 기준값: 앞 100행과 끝 100행 중 최고값
     _s = 100
-    _mid_s = max(0, n // 2 - _s // 2)
-    _samples = (values[:_s] +
-                values[_mid_s: _mid_s + _s] +
-                values[max(0, n - _s):])
+    _samples = values[:_s] + values[max(0, n - _s):]
     max_val = max(_samples) if _samples else values[0]
     max_lo = max_val - max_tolerance  # DOWN 시작/탐색 기준
     max_hi = max_val + max_tolerance  # UP 끝/복귀 기준
