@@ -40,21 +40,22 @@ def save_config(cfg: dict):
 def analyze_trends(values: list,
                    min_rows: int       = 3,
                    min_rate_abs: float = 0.0,
+                   min_delta: float    = 0.0,
                    timestamps: list    = None) -> list:
     """
     급격한 변화 구간 감지 (flat/노이즈 무시).
 
-    알고리즘:
-      Step1: 행별 순간 변화율 계산 (값 차이 / 시간 차이)
-             시간 없으면 값 차이로만 판별
-      Step2: |rate| >= min_rate_abs 이면 UP/DOWN, 아니면 FLAT(0)
-             min_rate_abs=0 이면 값 변화 방향만으로 판별
-      Step3: 짧은 구간 제거 (min_rows 미만)
-      Step4: 같은 방향 구간 연결 (사이에 FLAT만 있으면 무조건 합침, 수렴까지)
+    Step1+2: 행별 |rate| >= min_rate_abs → UP/DOWN, 아니면 FLAT
+             시간 없으면 값 방향만 사용
+    Step3:   짧고(< min_rows) 변화량도 작은(< min_delta) 구간 제거
+             둘 중 하나라도 충족하면 유효 (길이 충분 OR 변화량 충분)
+    Step4:   같은 방향 구간 연결 (수렴까지)
+             사이가 FLAT이거나, 짧고 변화량 작은 노이즈면 흡수하여 연결
 
     파라미터:
-      min_rows     : 유효 구간 최소 연속 행 수
-      min_rate_abs : 급격한 변화로 인정하는 최소 분당 변화율 (0=값방향만 사용)
+      min_rows     : 유효 구간 최소 행 수
+      min_rate_abs : 최소 분당 변화율 (0=미적용)
+      min_delta    : 짧은 구간도 유효로 인정하는 최소 값 변화량 (0=미적용)
     """
     n = len(values)
     if n == 0:
@@ -63,7 +64,6 @@ def analyze_trends(values: list,
     ts_n = len(timestamps) if timestamps else 0
 
     def get_dt(i, j):
-        """인덱스 i→j 시간 차이(분). 없으면 None."""
         if i < ts_n and j < ts_n:
             ti, tj = timestamps[i], timestamps[j]
             if ti and tj and tj != ti:
@@ -71,26 +71,20 @@ def analyze_trends(values: list,
                 return dt if dt != 0 else None
         return None
 
-    # Step1+2: 행별 분류 (1=UP, -1=DOWN, 0=FLAT)
+    # Step1+2: 행별 분류
     raw = [0] * n
     for i in range(1, n):
         dv = values[i] - values[i - 1]
         if dv == 0:
-            raw[i] = 0
             continue
         if min_rate_abs > 0.0:
             dt = get_dt(i - 1, i)
-            if dt is not None:
-                rate = abs(dv / dt)
-                if rate < min_rate_abs:
-                    raw[i] = 0; continue
-            # 시간 없으면 값 방향으로만 판별
+            if dt is not None and abs(dv / dt) < min_rate_abs:
+                continue
         raw[i] = 1 if dv > 0 else -1
-    # 첫 행은 이전 값이 없으므로 두 번째 행 방향 계승
     if n >= 2:
         raw[0] = raw[1]
 
-    # Step3: min_rows 미만 구간 제거
     def get_segs(data):
         segs = []; i = 0
         while i < n:
@@ -99,12 +93,22 @@ def analyze_trends(values: list,
             segs.append((i, j - 1, d)); i = j
         return segs
 
+    def mid_delta(ms, me):
+        """구간 진입 직전 값 기준 변화량"""
+        v_before = values[ms - 1] if ms > 0 else values[ms]
+        return abs(values[me] - v_before)
+
+    # Step3: 짧고 변화량도 작은 구간만 제거 (하나라도 충족하면 유효)
     result = [0] * n
     for s, e, d in get_segs(raw):
-        if d != 0 and (e - s + 1) >= min_rows:
-            result[s:e + 1] = [d] * (e - s + 1)
+        if d == 0: continue
+        length = e - s + 1
+        delta  = mid_delta(s, e)
+        if length >= min_rows or (min_delta > 0 and delta >= min_delta):
+            result[s:e + 1] = [d] * length
 
-    # Step4: 같은 방향 연결 (사이에 FLAT(0)만 있으면 합침, 수렴까지)
+    # Step4: 같은 방향 연결
+    # 사이가 FLAT(0)이거나, 짧고 변화량 작은 노이즈 구간이면 흡수하여 연결
     for direction in (1, -1):
         changed = True
         while changed:
@@ -114,13 +118,17 @@ def analyze_trends(values: list,
                 ls, le, ld = segs[si - 1]
                 ms, me, md = segs[si]
                 rs, re, rd = segs[si + 1]
-                if ld != direction or rd != direction or md != 0: continue
-                result[ms:me + 1] = [direction] * (me - ms + 1)
+                if ld != direction or rd != direction: continue
+                mid_len = me - ms + 1
+                is_flat  = (md == 0)
+                is_noise = (mid_len < min_rows and
+                            min_delta > 0 and mid_delta(ms, me) < min_delta)
+                if not (is_flat or is_noise): continue
+                result[ms:me + 1] = [direction] * mid_len
                 changed = True; break
 
     _MAP = {1: "UP", -1: "DOWN", 0: ""}
     return [_MAP[c] for c in result]
-
 
 def count_groups(trends: list, direction: str) -> int:
     """연속 direction 구간 개수"""
@@ -819,6 +827,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 t_trends = analyze_trends(temp_vals,
                                           int(t_cfg.get("min_rows", 3)),
                                           float(t_cfg.get("min_rate_abs", 0.0)),
+                                          float(t_cfg.get("min_delta", 0.0)),
                                           timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
@@ -844,6 +853,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 h_trends = analyze_trends(humid_vals,
                                           int(h_cfg.get("min_rows", 3)),
                                           float(h_cfg.get("min_rate_abs", 0.0)),
+                                          float(h_cfg.get("min_delta", 0.0)),
                                           timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
@@ -901,11 +911,10 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
 
             # config 설정 텍스트 — chart_info 저장 전에 생성
             def _cfg_text(cfg):
-                mr = cfg.get('min_rows', 3)
                 return (
-                    f"min_rows:     {mr}\n"
-                    f"  (flat/noise: {max(mr-1,0)})\n"
-                    f"min_rate_abs: {cfg.get('min_rate_abs', 0.0)}"
+                    f"min_rows:     {cfg.get('min_rows',3)}\n"
+                    f"min_rate_abs: {cfg.get('min_rate_abs',0.0)}\n"
+                    f"min_delta:    {cfg.get('min_delta',0.0)}"
                 )
             t_cfg_text = _cfg_text(t_cfg)
             h_cfg_text = _cfg_text(h_cfg)
@@ -1036,9 +1045,11 @@ class SensorConfigFrame(tk.LabelFrame):
         self.configure(background=bg)
         self.min_rows_var     = tk.StringVar(value=str(init.get("min_rows",     3)))
         self.min_rate_abs_var = tk.StringVar(value=str(init.get("min_rate_abs", 0.0)))
+        self.min_delta_var    = tk.StringVar(value=str(init.get("min_delta",    0.0)))
         for i, (lbl, var) in enumerate([
             ("min_rows     (유효 구간 최소 행)", self.min_rows_var),
             ("min_rate_abs (최소 분당 변화율)",  self.min_rate_abs_var),
+            ("min_delta    (최소 값 변화량)",    self.min_delta_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
                      anchor="e", width=22).grid(
@@ -1049,7 +1060,8 @@ class SensorConfigFrame(tk.LabelFrame):
 
     def get(self):
         return {"min_rows":     int(self.min_rows_var.get()),
-                "min_rate_abs": float(self.min_rate_abs_var.get())}
+                "min_rate_abs": float(self.min_rate_abs_var.get()),
+                "min_delta":    float(self.min_delta_var.get())}
 
 # ══════════════════════════════════════════════
 # GUI: 시트 행
