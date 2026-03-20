@@ -82,8 +82,8 @@ def analyze_trends(values: list,
     _s = 100
     _samples = values[:_s] + values[max(0, n - _s):]
     max_val = max(_samples) if _samples else values[0]
-    max_lo = max_val - max_tolerance  # DOWN 시작/탐색 기준
-    max_hi = max_val + max_tolerance  # UP 끝/복귀 기준
+    max_lo = max_val - max_tolerance  # 값 > max 비교 기준 (복귀/끝 판단)
+    max_hi = max_val + max_tolerance  # 값 < max 비교 기준 (DOWN 시작/하강 판단)
 
     def get_rate(i):
         if i <= 0: return 0.0
@@ -101,7 +101,7 @@ def analyze_trends(values: list,
     while i < n:
         # ── DOWN 시작 탐색 ───────────────────────────────────
         # min_rate 연속 구간 길이가 noise_max_rows 초과여야 유효
-        if values[i] < max_lo and abs(get_rate(i)) >= min_rate:
+        if values[i] < max_hi and abs(get_rate(i)) >= min_rate:
             # min_rate 연속 구간 길이 측정
             rate_run = i
             while rate_run + 1 < n and abs(get_rate(rate_run + 1)) >= min_rate:
@@ -117,7 +117,7 @@ def analyze_trends(values: list,
             is_noise = False
             k = i + 1
             while k < n and get_rate(k) <= -min_rate:
-                if values[k] >= max_hi:
+                if values[k] >= max_lo:
                     is_noise = True
                     break
                 k += 1
@@ -134,7 +134,7 @@ def analyze_trends(values: list,
             k = i + 1
             rising_count = 0
             while k < n:
-                if values[k] >= max_hi:
+                if values[k] >= max_lo:
                     break   # 기준값 복귀 → DOWN 끝 확정
                 if values[k] < values[valley_idx]:
                     valley_idx = k      # 새 최저값 → 계속, 상승 카운트 리셋
@@ -181,7 +181,7 @@ def analyze_trends(values: list,
                 up_end = up_start
                 q = up_start
                 while q < n:
-                    if values[q] >= max_hi:
+                    if values[q] >= max_lo:
                         up_end = q
                         break
                     q += 1
