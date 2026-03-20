@@ -40,40 +40,40 @@ def save_config(cfg: dict):
 def analyze_trends(values: list,
                    min_rate: float      = 0.0,
                    lookahead_rows: int  = 3,
+                   noise_min_rows: int  = 0,
                    timestamps: list     = None) -> list:
     """
     DOWN/UP 그룹 감지.
 
-    기준값: values[0] (시리즈 시작값)
+    기준값: values[0]
 
     DOWN:
-      시작: 값 < 기준값  AND  |분당변화율| >= min_rate 인 첫 행
-      끝  : 분당변화율 < min_rate 가 된 지점에서 lookahead_rows 행 더 확인하여
-            최저값을 찾는 과정을 최저값이 갱신되지 않을 때까지 반복
+      시작: 값 < 기준값  AND  |rate| >= min_rate 인 첫 행
+      끝  : rate < min_rate 지점에서 lookahead_rows 행 추가 확인 → 최저값
+            최저값 갱신 시 계속, 갱신 없으면 확정
       시작~끝 전체를 DOWN으로 채움
+      길이 <= noise_min_rows 이면 노이즈로 무시
 
     UP:
-      시작: DOWN 끝 다음 행
+      시작: DOWN 끝 이후  rate >= min_rate 인 첫 행 (FLAT 건너뜀)
       끝  : 값 >= 기준값 이 된 행
       시작~끝 전체를 UP으로 채움
-
-    이후 다음 DOWN 탐지를 이어서 반복
+      길이 <= noise_min_rows 이면 노이즈로 무시
 
     파라미터:
-      min_rate      : DOWN 시작 기준 최소 분당 변화율 절대값
-      lookahead_rows: DOWN 끝 탐색 시 추가 확인 행 수
+      min_rate      : DOWN/UP 기준 최소 분당 변화율 절대값
+      lookahead_rows: DOWN 끝 탐색 추가 확인 행 수
+      noise_min_rows: 이 이하 길이의 그룹은 노이즈로 무시 (0=미적용)
     """
     n = len(values)
     if n == 0:
         return []
 
     ts_n = len(timestamps) if timestamps else 0
-    start_val = values[0]   # 기준값
+    start_val = values[0]
 
     def get_rate(i):
-        """i-1 → i 구간 분당 변화율. 시간 없으면 값 차이 반환."""
-        if i <= 0:
-            return 0.0
+        if i <= 0: return 0.0
         dv = values[i] - values[i - 1]
         if i < ts_n and i - 1 < ts_n:
             ti, tj = timestamps[i - 1], timestamps[i]
@@ -82,67 +82,70 @@ def analyze_trends(values: list,
                 return dv / dt if dt != 0 else 0.0
         return float(dv)
 
-    result = [0] * n   # 0=없음, 1=UP, -1=DOWN
+    result = [0] * n
 
-    i = 1   # 0번 행은 기준값이므로 1번부터 탐색
+    i = 1
     while i < n:
         # ── DOWN 시작 탐색 ───────────────────────────────────
-        # 조건: 값 < 기준값 AND |rate| >= min_rate
         if values[i] < start_val and abs(get_rate(i)) >= min_rate:
             down_start = i
 
-            # ── DOWN 끝 탐색 ─────────────────────────────────
-            # |rate| < min_rate 가 된 지점에서 lookahead_rows 더 확인
-            # 최저값이 갱신되면 계속, 갱신 안 되면 확정
+            # ── DOWN 끝 탐색 (lookahead 방식) ────────────────
             k = i
             valley_idx = i
-
             while k < n:
-                # 현재 k에서 rate 확인
                 if abs(get_rate(k)) >= min_rate:
-                    # 아직 활성 하강/상승 중
                     if values[k] < values[valley_idx]:
                         valley_idx = k
                     k += 1
                 else:
-                    # rate < min_rate: lookahead_rows 만큼 앞 확인
                     look_end = min(k + lookahead_rows, n)
                     new_valley = valley_idx
                     for m in range(k, look_end):
                         if values[m] < values[new_valley]:
                             new_valley = m
                     if new_valley != valley_idx:
-                        # 최저값 갱신 → 계속 탐색
                         valley_idx = new_valley
                         k = new_valley + 1
                     else:
-                        # 갱신 없음 → DOWN 끝 확정
                         break
 
             down_end = valley_idx
+            down_len = down_end - down_start + 1
 
-            # DOWN 시작~끝 채움
-            if down_end >= down_start:
-                for idx in range(down_start, down_end + 1):
-                    result[idx] = -1
+            # 노이즈 판단
+            if noise_min_rows > 0 and down_len <= noise_min_rows:
+                i = down_end + 1
+                continue
 
-            # ── UP 탐색 ──────────────────────────────────────
-            # UP 시작: down_end + 1
-            up_start = down_end + 1
-            if up_start < n:
+            # DOWN 채움
+            for idx in range(down_start, down_end + 1):
+                result[idx] = -1
+
+            # ── UP 시작 탐색 ─────────────────────────────────
+            # DOWN 끝 이후 rate >= min_rate 인 첫 행 탐색
+            p = down_end + 1
+            while p < n and get_rate(p) < min_rate:
+                p += 1
+            # p = UP 시작 (rate >= min_rate 첫 행)
+
+            if p < n:
+                up_start = p
                 # UP 끝: 값 >= 기준값 이 된 행
                 up_end = up_start
-                p = up_start
-                while p < n:
-                    if values[p] >= start_val:
-                        up_end = p
+                q = up_start
+                while q < n:
+                    if values[q] >= start_val:
+                        up_end = q
                         break
-                    p += 1
+                    q += 1
                 else:
-                    up_end = n - 1  # 기준값에 못 도달하면 끝까지
+                    up_end = n - 1
 
-                # UP 시작~끝 채움
-                if up_end >= up_start:
+                up_len = up_end - up_start + 1
+
+                # 노이즈 판단
+                if noise_min_rows == 0 or up_len > noise_min_rows:
                     for idx in range(up_start, up_end + 1):
                         result[idx] = 1
 
@@ -844,6 +847,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 t_trends = analyze_trends(temp_vals,
                                           float(t_cfg.get("min_rate",       0.0)),
                                           int(t_cfg.get("lookahead_rows",  3)),
+                                          int(t_cfg.get("noise_min_rows",  0)),
                                           timestamps)
                 t_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Temp_Trend", t_trends)
@@ -869,6 +873,7 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
                 h_trends = analyze_trends(humid_vals,
                                           float(h_cfg.get("min_rate",       0.0)),
                                           int(h_cfg.get("lookahead_rows",  3)),
+                                          int(h_cfg.get("noise_min_rows",  0)),
                                           timestamps)
                 h_trend_col = write_trend_col(ws, header_row, data_start_row,
                                               "Humid_Trend", h_trends)
@@ -932,7 +937,8 @@ def process_all_sheets(filepath: str, sheet_cfg_map: dict,
             def _cfg_text(cfg):
                 return (
                     f"min_rate:       {cfg.get('min_rate',0.0)}\n"
-                    f"lookahead_rows: {cfg.get('lookahead_rows',3)}"
+                    f"lookahead_rows: {cfg.get('lookahead_rows',3)}\n"
+                    f"noise_min_rows: {cfg.get('noise_min_rows',0)}"
                 )
             t_cfg_text = _cfg_text(t_cfg)
             h_cfg_text = _cfg_text(h_cfg)
@@ -1065,9 +1071,11 @@ class SensorConfigFrame(tk.LabelFrame):
         self.configure(background=bg)
         self.min_rate_var       = tk.StringVar(value=str(init.get("min_rate",       0.0)))
         self.lookahead_rows_var = tk.StringVar(value=str(init.get("lookahead_rows", 3)))
+        self.noise_min_rows_var = tk.StringVar(value=str(init.get("noise_min_rows", 0)))
         for i, (lbl, var) in enumerate([
-            ("min_rate       (DOWN 기준 분당 변화율)", self.min_rate_var),
-            ("lookahead_rows (DOWN 끝 탐색 추가 행)",  self.lookahead_rows_var),
+            ("min_rate       (기준 분당 변화율)",    self.min_rate_var),
+            ("lookahead_rows (DOWN 끝 탐색 추가행)", self.lookahead_rows_var),
+            ("noise_min_rows (노이즈 최대 행)",      self.noise_min_rows_var),
         ]):
             tk.Label(self, text=lbl, font=lf, bg=bg, fg=fg,
                      anchor="e", width=26).grid(
@@ -1078,7 +1086,8 @@ class SensorConfigFrame(tk.LabelFrame):
 
     def get(self):
         return {"min_rate":       float(self.min_rate_var.get()),
-                "lookahead_rows": int(self.lookahead_rows_var.get())}
+                "lookahead_rows": int(self.lookahead_rows_var.get()),
+                "noise_min_rows": int(self.noise_min_rows_var.get())}
 
 # ══════════════════════════════════════════════
 # GUI: 시트 행
@@ -1409,8 +1418,8 @@ class App(tk.Tk):
             self.config_data = cfg
             self._log(
                 f"설정 저장\n"
-                f"  🌡 temp : min_rate={cfg['temp']['min_rate']}  lookahead_rows={cfg['temp']['lookahead_rows']}\n"
-                f"  💧 humid: min_rate={cfg['humid']['min_rate']}  lookahead_rows={cfg['humid']['lookahead_rows']}")
+                f"  🌡 temp : rate={cfg['temp']['min_rate']} look={cfg['temp']['lookahead_rows']} noise={cfg['temp']['noise_min_rows']}\n"
+                f"  💧 humid: rate={cfg['humid']['min_rate']} look={cfg['humid']['lookahead_rows']} noise={cfg['humid']['noise_min_rows']}")
         except ValueError:
             messagebox.showerror("오류", "final_min_rows는 정수로 입력하세요.")
 
