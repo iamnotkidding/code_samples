@@ -63,10 +63,12 @@ def analyze_trends(values: list,
       시작~끝 전체를 UP으로 채움
       길이 <= noise_max_rows 이면 노이즈로 무시
 
+    최종: 길이 <= noise_max_rows 인 그룹 제거
+
     파라미터:
       min_rate      : DOWN/UP 기준 최소 분당 변화율 절대값
       lookahead_rows: DOWN 끝 탐색 추가 확인 행 수
-      noise_max_rows: 이 이하 길이의 그룹은 노이즈로 무시 (0=미적용)
+      noise_max_rows: 노이즈 최대 행 수 — 진행 중 및 최종 제거 모두 적용 (0=미적용)
     """
     n = len(values)
     if n == 0:
@@ -174,6 +176,16 @@ def analyze_trends(values: list,
                 i = down_end + 1
         else:
             i += 1
+
+    # 최종 노이즈 제거: 길이 <= noise_max_rows 인 그룹 제거
+    if noise_max_rows > 0:
+        i = 0
+        while i < n:
+            d = result[i]; j = i
+            while j < n and result[j] == d: j += 1
+            if d != 0 and (j - i) <= noise_max_rows:
+                for k in range(i, j): result[k] = 0
+            i = j
 
     _MAP = {1: "UP", -1: "DOWN", 0: ""}
     return [_MAP[c] for c in result]
