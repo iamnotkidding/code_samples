@@ -1,6 +1,7 @@
 package com.qa.myphoto
 
 
+
 import android.Manifest
 import android.content.ContentUris
 import android.net.Uri
@@ -198,6 +199,7 @@ fun MainGalleryApp() {
                     
                     Spacer(modifier = Modifier.weight(1f))
                     
+                    // [요구사항 2] 버튼 텍스트 변경
                     Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }) {
                         Text(if (isAutoScrollEnabled) "정지" else "자동")
                     }
@@ -248,54 +250,98 @@ fun OptimalReflowGrid(
     
     val totalGridCells = 120 
 
+    // [요구사항 2, 3] 완벽한 테트리스 비율 재계산 로직
     val (itemSpans, rowMaxScales) = remember(items, displayColumns, itemScales.toMap()) {
         if (items.isEmpty()) return@remember Pair(IntArray(0), FloatArray(0))
         
         val spans = IntArray(items.size)
         val maxScales = FloatArray(items.size)
         
-        var currentLineSpan = 0
-        val baseSpan = totalGridCells / displayColumns
-        val currentRowIndices = mutableListOf<Int>()
+        val baseSpanSize = totalGridCells / displayColumns
+        // 축소/확대 시 다른 파일들이 줄어들 수 있는 최소 스팬(칸수) 제한 
+        val MIN_SPAN = totalGridCells / 5 // 약 20% 최소폭 유지
         
-        for (i in items.indices) {
-            val scale = itemScales[items[i].id] ?: 1f
-            var preferredSpan = (baseSpan * scale).toInt()
+        var i = 0
+        while (i < items.size) {
+            val rowIndices = mutableListOf<Int>()
+            var j = i
             
-            if (items[i].isWide && displayColumns > 1 && scale == 1f) {
-                preferredSpan = (baseSpan * 1.5).toInt()
-            }
-            preferredSpan = preferredSpan.coerceIn(1, totalGridCells)
-
-            val remainingInLine = totalGridCells - currentLineSpan
-
-            if (currentLineSpan > 0 && preferredSpan > remainingInLine) {
-                spans[i - 1] += remainingInLine
+            // 한 줄(Row) 구성 시도
+            while (j < items.size) {
+                rowIndices.add(j)
                 
-                val maxScaleInRow = currentRowIndices.maxOfOrNull { itemScales[items[it].id] ?: 1f } ?: 1f
-                for (idx in currentRowIndices) {
-                    maxScales[idx] = maxScaleInRow
+                val desired = rowIndices.map { k ->
+                    val scale = itemScales[items[k].id] ?: 1f
+                    val base = if (items[k].isWide && displayColumns > 1 && scale == 1f) (baseSpanSize * 1.5).toInt() else baseSpanSize
+                    base * scale
+                }
+                val sumDesired = desired.sum()
+                
+                if (rowIndices.size == 1) {
+                    if (sumDesired >= totalGridCells) {
+                        j++
+                        break
+                    }
+                    j++
+                    continue
                 }
                 
-                currentRowIndices.clear()
-                currentLineSpan = 0
-            }
+                // 정규화 후 최소 가로 크기 위반 여부 확인
+                var isValid = true
+                for (idx in rowIndices.indices) {
+                    val k = rowIndices[idx]
+                    val scale = itemScales[items[k].id] ?: 1f
+                    val allocated = (totalGridCells * desired[idx] / sumDesired).toInt()
+                    
+                    // 최소 보장폭 설정
+                    val requiredMin = (MIN_SPAN * minOf(1f, scale)).toInt().coerceAtLeast(10)
+                    if (allocated < requiredMin) {
+                        isValid = false
+                        break
+                    }
+                }
+                
+                val sumBase = rowIndices.sumOf { k -> 
+                    val scale = itemScales[items[k].id] ?: 1f
+                    if (items[k].isWide && displayColumns > 1 && scale == 1f) (baseSpanSize * 1.5).toInt() else baseSpanSize
+                }
 
-            spans[i] = preferredSpan
-            currentRowIndices.add(i)
-            currentLineSpan += preferredSpan
-        }
-        
-        if (currentLineSpan in 1 until totalGridCells) {
-            spans[items.lastIndex] += (totalGridCells - currentLineSpan)
-        }
-        if (currentRowIndices.isNotEmpty()) {
-            val maxScaleInRow = currentRowIndices.maxOfOrNull { itemScales[items[it].id] ?: 1f } ?: 1f
-            for (idx in currentRowIndices) {
-                maxScales[idx] = maxScaleInRow
+                // 기기 기본 용량을 넘어섰거나(가로 꽉참) 억지로 축소시켜서 남은 공간이 생겼을 때의 줄바꿈 제어
+                if (sumBase >= totalGridCells && sumDesired >= totalGridCells) {
+                    if (isValid) { j++; break } 
+                    else { rowIndices.removeLast(); break }
+                }
+
+                if (!isValid) {
+                    rowIndices.removeLast()
+                    break
+                }
+                j++
             }
+            
+            // 줄 내 아이템 스팬 확정 및 120칸에 100% 꽉 채워지도록 강제 분배
+            val finalDesired = rowIndices.map { k ->
+                val scale = itemScales[items[k].id] ?: 1f
+                val base = if (items[k].isWide && displayColumns > 1 && scale == 1f) (baseSpanSize * 1.5).toInt() else baseSpanSize
+                base * scale
+            }
+            val sumFinal = finalDesired.sum()
+            var allocatedSum = 0
+            val maxScaleInRow = rowIndices.maxOfOrNull { itemScales[items[it].id] ?: 1f } ?: 1f
+            
+            for (idx in rowIndices.indices) {
+                val k = rowIndices[idx]
+                val allocated = if (idx == rowIndices.lastIndex) {
+                    totalGridCells - allocatedSum // 마지막 파일은 남은 칸 전체 흡수
+                } else {
+                    (totalGridCells * finalDesired[idx] / sumFinal).toInt()
+                }
+                spans[k] = allocated
+                allocatedSum += allocated
+                maxScales[k] = maxScaleInRow // [요구사항 3] 해당 파일 아래 빈공간 채움
+            }
+            i += rowIndices.size
         }
-        
         Pair(spans, maxScales)
     }
 
@@ -333,7 +379,8 @@ fun OptimalReflowGrid(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    // [요구사항 1] 파일 경계색을 흰색(Color.White)으로 변경
+    Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Fixed(totalGridCells),
@@ -358,7 +405,6 @@ fun OptimalReflowGrid(
                 val baseRowHeight = (360 / displayColumns).dp
                 val itemHeight = baseRowHeight * rowMaxScale
                 
-                // [수정] Box가 정해준 itemHeight 높이에 맞춰 카드가 강제로 세로 빈 공간을 채웁니다.
                 Box(Modifier.height(itemHeight).fillMaxWidth()) {
                     DynamicRatioMediaCard(
                         item = item,
@@ -367,8 +413,7 @@ fun OptimalReflowGrid(
                         itemScale = itemScale,     
                         onScaleChange = { newScale -> itemScales[item.id] = newScale },
                         imageLoader = imageLoader,
-                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id },
-                        isCustomTab = isCustomTab 
+                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
                     )
                 }
             }
@@ -390,8 +435,10 @@ fun OptimalReflowGrid(
             }
         }
 
-        if (isCustomTab && activeVideoId != null) {
-            val scale = itemScales[activeVideoId] ?: 1f
+        // [요구사항 4] 커스텀 탭에서 재생(자동 포함)되는 영상이 있으면 정밀 조절 바 항상 노출
+        val activeControlVideoId = activeVideoId ?: centerVideoId
+        if (isCustomTab && activeControlVideoId != null) {
+            val scale = itemScales[activeControlVideoId] ?: 1f
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -406,7 +453,7 @@ fun OptimalReflowGrid(
                 )
                 Slider(
                     value = scale,
-                    onValueChange = { itemScales[activeVideoId!!] = it },
+                    onValueChange = { itemScales[activeControlVideoId] = it },
                     valueRange = 0.5f..4f,
                     colors = SliderDefaults.colors(
                         thumbColor = MaterialTheme.colorScheme.primary,
@@ -427,15 +474,13 @@ fun DynamicRatioMediaCard(
     itemScale: Float,
     onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
-    onPlayToggle: () -> Unit,
-    isCustomTab: Boolean
+    onPlayToggle: () -> Unit
 ) {
     val context = LocalContext.current
     var isZooming by remember { mutableStateOf(false) }
     var visualScale by remember { mutableFloatStateOf(layoutScale) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     
-    var showInCardSlider by remember { mutableStateOf(false) }
     var isMuted by remember { mutableStateOf(true) }
 
     LaunchedEffect(layoutScale) {
@@ -447,14 +492,12 @@ fun DynamicRatioMediaCard(
 
     Card(
         modifier = Modifier
-            // [수정] aspectRatio를 제거하고 부모 Box의 크기를 빈틈없이 채우도록 fillMaxSize 적용
             .fillMaxSize() 
-            .zIndex(if (isZooming || showInCardSlider) 1f else 0f)
+            .zIndex(if (isZooming) 1f else 0f)
             .pointerInput(Unit) {
                 detectTwoFingerGesture(
                     onGestureStart = { 
                         isZooming = true
-                        showInCardSlider = false
                     },
                     onGesture = { pan, zoom ->
                         visualScale = (visualScale * zoom).coerceIn(0.5f, 4f)
@@ -468,7 +511,7 @@ fun DynamicRatioMediaCard(
                 )
             },
         shape = RectangleShape,
-        colors = CardDefaults.cardColors(containerColor = Color.Black)
+        colors = CardDefaults.cardColors(containerColor = Color.White) // 경계색 일치화
     ) {
         val renderScale = visualScale / layoutScale
 
@@ -496,7 +539,6 @@ fun DynamicRatioMediaCard(
                     VideoPlayerCore(item.uri, isMuted)
                 } else {
                     IconButton(onClick = onPlayToggle) { 
-                        // [수정] 재생(PlayArrow) 화살표 아이콘을 48.dp -> 32.dp로 축소
                         Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(32.dp)) 
                     }
                 }
