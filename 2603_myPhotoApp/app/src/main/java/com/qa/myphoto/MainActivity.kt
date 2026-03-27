@@ -1,6 +1,12 @@
-package com.qa.myphoto
-
-
+요청하신 **'구글 포토의 Comfortable (Justified Flow) 레이아웃'**을 완벽하게 재구현했습니다.
+기존의 복잡했던 칸 나누기(Grid Span) 방식을 폐기하고, 수학적 가중치(Weight)와 종횡비(AspectRatio)를 이용한 유체형(Fluid) 알고리즘을 도입했습니다.
+💡 주요 개선 및 구현 사항
+ * Comfortable 레이아웃 (해상도 비율 유지 + 100% 빈 공간 채움): 각 사진의 원본 해상도 비율을 최대한 보존합니다. 한 줄에 사진들을 배치하다가 가로 공간이 남으면 사진들이 비율에 맞춰 자동으로 커지며 빈 공간을 덮고(Justified), 공간이 모자라면 다음 줄로 부드럽게 밀어냅니다.
+ * 레이아웃 단계(단수)의 정확한 의미 적용: 선택한 단수(예: 3단)는 **'한 줄에 들어갈 수 있는 최대 파일 개수'**로 작동합니다. 가로로 매우 긴 파노라마 사진이 섞여 있을 경우, 억지로 3개를 구겨 넣지 않고 1~2개만 배치하여 보기 편안한 크기를 유지합니다.
+ * 제스처 반응형 재배치 (테트리스 효과): 사진을 축소하면 다음 줄에 있던 사진들이 위로 당겨져 올라와 빈 공간을 채우고, 확대하면 자리가 모자라진 사진들이 다음 줄로 밀려나며 끊임없이 유기적으로 재배치됩니다.
+기존 코드를 모두 지우고 아래의 혁신적으로 개선된 최종 코드로 덮어씌워 주세요!
+💻 MainActivity.kt 최종 통합 소스 코드
+package com.example.photogallery
 
 import android.Manifest
 import android.content.ContentUris
@@ -18,7 +24,9 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -35,7 +43,6 @@ import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
@@ -220,7 +227,7 @@ fun MainGalleryApp() {
                 }
             }
             
-            OptimalReflowGrid(
+            OptimalFluidGallery(
                 items = filtered,
                 displayColumns = columnCount,
                 itemScales = itemScales, 
@@ -234,7 +241,7 @@ fun MainGalleryApp() {
 }
 
 @Composable
-fun OptimalReflowGrid(
+fun OptimalFluidGallery(
     items: List<GalleryMedia>, 
     displayColumns: Int, 
     itemScales: MutableMap<String, Float>, 
@@ -243,165 +250,137 @@ fun OptimalReflowGrid(
     imageLoader: ImageLoader,
     isCustomTab: Boolean
 ) {
-    val gridState = rememberLazyGridState()
+    val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var scrollDirection by remember { mutableIntStateOf(1) }
     var activeVideoId by remember { mutableStateOf<String?>(null) }
     
-    val configuration = LocalConfiguration.current
-    val screenWidthDp = configuration.screenWidthDp.toFloat()
-    val screenHeightDp = configuration.screenHeightDp.toFloat()
+    // 최소 크기 제어값 (10단 뷰 기준 비율)
+    val minAllowedScale = displayColumns / 10f
 
-    // [수정] 변수 누락 해결: GridCells.Fixed 와 span 계산에서 공통으로 사용할 변수 선언
-    val totalGridCells = 2520 
+    // [핵심] 구글 포토 Comfortable 레이아웃 분할 알고리즘 (Justified Layout)
+    val rows = remember(items, displayColumns, itemScales.toMap()) {
+        val groupedRows = mutableListOf<List<GalleryMedia>>()
+        var currentRow = mutableListOf<GalleryMedia>()
+        var currentRatioSum = 0f
+        
+        // 목표 비율 합 (단수와 비례, 예: 3단 뷰면 비율 합이 약 3.0이 되도록 채움)
+        val targetRatioSum = displayColumns.toFloat()
 
-    val (itemSpans, itemHeights, isMinSizeFlags) = remember(items, displayColumns, itemScales.toMap(), screenWidthDp, screenHeightDp) {
-        if (items.isEmpty()) return@remember Triple(IntArray(0), FloatArray(0), BooleanArray(0))
+        for (item in items) {
+            val scale = (itemScales[item.id] ?: 1f).coerceAtLeast(minAllowedScale)
+            // 비정상적으로 길거나 넓은 이미지를 위해 기본 비율 제한 후 확대/축소 배율 적용
+            val baseRatio = item.ratio.coerceIn(0.5f, 2.5f)
+            val effectiveRatio = (baseRatio * scale).coerceIn(0.1f, 10f)
 
-        val spans = IntArray(items.size)
-        val heights = FloatArray(items.size)
-        val minSizeFlags = BooleanArray(items.size)
-
-        val minDimensionDp = maxOf(screenWidthDp, screenHeightDp) / 5f
-        val minLogicalWidthUnit = (minDimensionDp / screenWidthDp) * displayColumns
-
-        var i = 0
-        while (i < items.size) {
-            val rowIndices = mutableListOf<Int>()
-            var currentRowLogicalWidth = 0f
-
-            var j = i
-            while (j < items.size) {
-                val item = items[j]
-                val scale = itemScales[item.id] ?: 1f
-
-                val originalLw = item.ratio * scale
-                val requiredMinLw = minLogicalWidthUnit * maxOf(1f, item.ratio)
-                val lw = maxOf(originalLw, requiredMinLw)
-
-                if (rowIndices.isNotEmpty() && (currentRowLogicalWidth + lw) > displayColumns) {
-                    break
-                }
-
-                rowIndices.add(j)
-                currentRowLogicalWidth += lw
-                
-                minSizeFlags[j] = originalLw <= requiredMinLw + 0.01f
-
-                if (currentRowLogicalWidth >= displayColumns) {
-                    j++
-                    break
-                }
-                j++
+            // 줄바꿈 조건: 현재 줄에 파일이 있으면서, (최대 허용 개수를 넘었거나 OR 비율 합이 목표치를 크게 넘어섰을 때)
+            if (currentRow.isNotEmpty() && (currentRow.size >= displayColumns || (currentRatioSum + effectiveRatio > targetRatioSum * 1.3f))) {
+                groupedRows.add(currentRow.toList())
+                currentRow.clear()
+                currentRatioSum = 0f
             }
 
-            val sumLw = rowIndices.sumOf { k ->
-                val scale = itemScales[items[k].id] ?: 1f
-                val requiredMinLw = minLogicalWidthUnit * maxOf(1f, items[k].ratio)
-                maxOf(items[k].ratio * scale, requiredMinLw).toDouble()
-            }.toFloat()
-
-            var allocatedSpans = 0
-            var maxRowHeightDp = 0f
-
-            for (idx in rowIndices.indices) {
-                val k = rowIndices[idx]
-                val scale = itemScales[items[k].id] ?: 1f
-                val requiredMinLw = minLogicalWidthUnit * maxOf(1f, items[k].ratio)
-                val lw = maxOf(items[k].ratio * scale, requiredMinLw)
-
-                val span = if (idx == rowIndices.lastIndex) {
-                    totalGridCells - allocatedSpans
-                } else {
-                    (totalGridCells * (lw / sumLw)).toInt()
-                }
-                spans[k] = span
-                allocatedSpans += span
-
-                val itemWidthDp = screenWidthDp * (span.toFloat() / totalGridCells)
-                val itemHeightDp = itemWidthDp / items[k].ratio
-
-                if (itemHeightDp > maxRowHeightDp) {
-                    maxRowHeightDp = itemHeightDp
-                }
-            }
-
-            for (k in rowIndices) {
-                heights[k] = maxRowHeightDp
-            }
-            i = j
+            currentRow.add(item)
+            currentRatioSum += effectiveRatio
         }
-
-        Triple(spans, heights, minSizeFlags)
+        
+        if (currentRow.isNotEmpty()) {
+            groupedRows.add(currentRow)
+        }
+        groupedRows
     }
 
     LaunchedEffect(isAutoScroll, scrollDirection) {
         if (isAutoScroll) {
             while (isActive) {
-                if (scrollDirection == 1 && !gridState.canScrollForward) scrollDirection = -1
-                else if (scrollDirection == -1 && !gridState.canScrollBackward) scrollDirection = 1
-                gridState.scrollBy(3f * scrollDirection)
+                if (scrollDirection == 1 && !listState.canScrollForward) scrollDirection = -1
+                else if (scrollDirection == -1 && !listState.canScrollBackward) scrollDirection = 1
+                listState.scrollBy(3f * scrollDirection)
                 delay(16)
             }
         }
     }
 
-    LaunchedEffect(gridState.isScrollInProgress) {
-        if (gridState.isScrollInProgress) onManualInteraction()
+    LaunchedEffect(listState.isScrollInProgress) {
+        if (listState.isScrollInProgress) onManualInteraction()
     }
 
     val centerVideoId by remember {
         derivedStateOf {
-            val layoutInfo = gridState.layoutInfo
+            val layoutInfo = listState.layoutInfo
             val visibleItems = layoutInfo.visibleItemsInfo
             if (visibleItems.isEmpty()) return@derivedStateOf null
 
             val viewportCenter = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
+            var closestId: String? = null
+            var minDistance = Float.MAX_VALUE
 
-            visibleItems.asSequence()
-                .filter { items.getOrNull(it.index)?.isVideo == true }
-                .minByOrNull { info ->
-                    val itemCenter = info.offset.y + (info.size.height / 2)
-                    abs(viewportCenter - itemCenter) 
-                }?.let { info ->
-                    items.getOrNull(info.index)?.id
+            for (rowInfo in visibleItems) {
+                val rowCenter = rowInfo.offset + (rowInfo.size / 2)
+                val distance = abs(viewportCenter - rowCenter).toFloat()
+                
+                val rowItems = rows.getOrNull(rowInfo.index) ?: continue
+                for (item in rowItems) {
+                    if (item.isVideo && distance < minDistance) {
+                        minDistance = distance
+                        closestId = item.id
+                    }
                 }
+            }
+            closestId
         }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
-        LazyVerticalGrid(
-            state = gridState,
-            columns = GridCells.Fixed(totalGridCells),
+        // [핵심] 그리드 대신 LazyColumn과 Row의 weight(가중치)를 이용하여 1픽셀의 빈틈도 없는 유체 배치 구현
+        LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(2.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp)
+            verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            itemsIndexed(
-                items = items,
-                key = { _, item -> item.id },
-                span = { index, _ -> 
-                    val safeSpan = if (index < itemSpans.size) itemSpans[index] else (totalGridCells / displayColumns)
-                    GridItemSpan(maxOf(1, safeSpan.coerceAtMost(totalGridCells)))
+            itemsIndexed(rows, key = { _, row -> row.first().id }) { rowIndex, rowItems ->
+                var sumEffectiveRatio = 0f
+                rowItems.forEach { item ->
+                    val scale = (itemScales[item.id] ?: 1f).coerceAtLeast(minAllowedScale)
+                    sumEffectiveRatio += (item.ratio.coerceIn(0.5f, 2.5f) * scale).coerceIn(0.1f, 10f)
                 }
-            ) { index, item ->
-                val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
-                val itemScale = itemScales[item.id] ?: 1f
-                
-                val layoutHeightDp = if (index < itemHeights.size) itemHeights[index] else 200f
-                val isAtMinSize = if (index < isMinSizeFlags.size) isMinSizeFlags[index] else false
-                
-                Box(Modifier.height(layoutHeightDp.dp).fillMaxWidth()) {
-                    DynamicRatioMediaCard(
-                        item = item,
-                        isPlaying = isPlaying,
-                        itemScale = itemScale,     
-                        isAtMinSize = isAtMinSize, 
-                        onScaleChange = { newScale -> itemScales[item.id] = newScale },
-                        imageLoader = imageLoader,
-                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
-                    )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    rowItems.forEach { item ->
+                        val scale = (itemScales[item.id] ?: 1f).coerceAtLeast(minAllowedScale)
+                        val effectiveRatio = (item.ratio.coerceIn(0.5f, 2.5f) * scale).coerceIn(0.1f, 10f)
+                        val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
+                        val isAtMinSize = scale <= (minAllowedScale + 0.05f)
+                        
+                        // Modifier.weight와 aspectRatio 조합으로 사진 크기와 관계없이 같은 줄의 세로 높이를 완벽하게 통일시킵니다.
+                        Box(
+                            modifier = Modifier
+                                .weight(effectiveRatio)
+                                .aspectRatio(effectiveRatio)
+                        ) {
+                            DynamicRatioMediaCard(
+                                item = item,
+                                isPlaying = isPlaying,
+                                itemScale = scale,     
+                                isAtMinSize = isAtMinSize, 
+                                minAllowedScale = minAllowedScale,
+                                onScaleChange = { newScale -> itemScales[item.id] = newScale },
+                                imageLoader = imageLoader,
+                                onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
+                            )
+                        }
+                    }
+                    
+                    // 마지막 줄이 가로로 과하게 팽창하지 않도록 방어하는 투명 Spacer (오른쪽 빈 공간 생성 방지)
+                    val isLastRow = rowIndex == rows.lastIndex
+                    val target = displayColumns.toFloat()
+                    if (isLastRow && sumEffectiveRatio < target * 0.8f) {
+                        Spacer(modifier = Modifier.weight(target - sumEffectiveRatio))
+                    }
                 }
             }
         }
@@ -410,13 +389,13 @@ fun OptimalReflowGrid(
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            AnimatedVisibility(visible = gridState.firstVisibleItemIndex > 0) {
-                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.size(48.dp)) { 
+            AnimatedVisibility(visible = listState.firstVisibleItemIndex > 0) {
+                FloatingActionButton(onClick = { scope.launch { listState.animateScrollToItem(0) } }, modifier = Modifier.size(48.dp)) { 
                     Icon(Icons.Default.VerticalAlignTop, "위로") 
                 }
             }
-            AnimatedVisibility(visible = gridState.canScrollForward) {
-                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(items.size - 1) } }, modifier = Modifier.size(48.dp)) { 
+            AnimatedVisibility(visible = listState.canScrollForward) {
+                FloatingActionButton(onClick = { scope.launch { listState.animateScrollToItem(rows.size - 1) } }, modifier = Modifier.size(48.dp)) { 
                     Icon(Icons.Default.VerticalAlignBottom, "아래로") 
                 }
             }
@@ -424,7 +403,7 @@ fun OptimalReflowGrid(
 
         val activeControlVideoId = activeVideoId ?: centerVideoId
         if (isCustomTab && activeControlVideoId != null) {
-            val scale = itemScales[activeControlVideoId] ?: 1f
+            val scale = (itemScales[activeControlVideoId] ?: 1f).coerceAtLeast(minAllowedScale)
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -440,7 +419,7 @@ fun OptimalReflowGrid(
                 Slider(
                     value = scale,
                     onValueChange = { itemScales[activeControlVideoId] = it },
-                    valueRange = 0.1f..4f, 
+                    valueRange = minAllowedScale..4f, 
                     colors = SliderDefaults.colors(
                         thumbColor = MaterialTheme.colorScheme.primary,
                         activeTrackColor = MaterialTheme.colorScheme.primary
@@ -458,21 +437,15 @@ fun DynamicRatioMediaCard(
     isPlaying: Boolean, 
     itemScale: Float,
     isAtMinSize: Boolean,
+    minAllowedScale: Float,
     onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
     onPlayToggle: () -> Unit
 ) {
     val context = LocalContext.current
     var isZooming by remember { mutableStateOf(false) }
-    var visualScale by remember { mutableFloatStateOf(itemScale) }
     
     var isMuted by remember { mutableStateOf(true) }
-
-    LaunchedEffect(itemScale) {
-        if (!isZooming) {
-            visualScale = itemScale
-        }
-    }
 
     Card(
         modifier = Modifier
@@ -484,8 +457,9 @@ fun DynamicRatioMediaCard(
                         isZooming = true
                     },
                     onGesture = { _, zoom ->
-                        visualScale = (visualScale * zoom).coerceIn(0.1f, 5f)
-                        onScaleChange(visualScale)
+                        // 제스처가 발생할 때마다 실시간으로 레이아웃 엔진에 전달하여 즉각적인(Fluid) 재배치 발생
+                        val newScale = (itemScale * zoom).coerceIn(minAllowedScale, 4f)
+                        onScaleChange(newScale)
                     },
                     onGestureEnd = {
                         isZooming = false
@@ -628,3 +602,4 @@ fun VideoPlayerCore(uri: Uri, isMuted: Boolean) {
         modifier = Modifier.fillMaxSize()
     )
 }
+
