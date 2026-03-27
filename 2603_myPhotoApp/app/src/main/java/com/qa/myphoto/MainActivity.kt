@@ -18,7 +18,7 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.staggeredgrid.*
+import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -185,9 +185,7 @@ fun MainGalleryApp() {
                     }
                 }
                 Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { 
-                        itemScales.clear() 
-                    }) { 
+                    IconButton(onClick = { itemScales.clear() }) { 
                         Icon(Icons.Default.Refresh, "재배치 초기화") 
                     }
                     
@@ -199,8 +197,9 @@ fun MainGalleryApp() {
                     
                     Spacer(modifier = Modifier.weight(1f))
                     
+                    // [요구사항 2] 텍스트 변경
                     Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }) {
-                        Text(if (isAutoScrollEnabled) "자동 스크롤 중지" else "자동 스크롤 시작")
+                        Text(if (isAutoScrollEnabled) "정지" else "자동")
                     }
                 }
             }
@@ -226,6 +225,7 @@ fun MainGalleryApp() {
                 isAutoScroll = isAutoScrollEnabled,
                 onManualInteraction = { isAutoScrollEnabled = false },
                 imageLoader = videoImageLoader,
+                // [요구사항 1] 커스텀 탭(인덱스 3)인지 여부를 전달
                 isCustomTab = pageIdx == 3
             )
         }
@@ -242,11 +242,50 @@ fun OptimalReflowGrid(
     imageLoader: ImageLoader,
     isCustomTab: Boolean
 ) {
-    val gridState = rememberLazyStaggeredGridState()
+    val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
     var scrollDirection by remember { mutableIntStateOf(1) }
     var activeVideoId by remember { mutableStateOf<String?>(null) }
     
+    // 120칸 공배수 분할 (비율 정밀 계산용)
+    val totalGridCells = 120 
+
+    // [요구사항 3, 4] 축소/확대 크기에 맞춰 정확한 영역을 차지하고, 남는 공간은 이전/다음 아이템이 강제로 채움
+    val itemSpans = remember(items, displayColumns, itemScales.toMap()) {
+        if (items.isEmpty()) return@remember IntArray(0)
+        
+        val spans = IntArray(items.size)
+        var currentLineSpan = 0
+        val baseSpan = totalGridCells / displayColumns
+        
+        for (i in items.indices) {
+            val scale = itemScales[items[i].id] ?: 1f
+            var preferredSpan = (baseSpan * scale).toInt()
+            
+            if (items[i].isWide && displayColumns > 1 && scale == 1f) {
+                preferredSpan = (baseSpan * 1.5).toInt()
+            }
+            preferredSpan = preferredSpan.coerceIn(1, totalGridCells)
+
+            val remainingInLine = totalGridCells - currentLineSpan
+
+            // 현재 아이템이 남은 공간보다 크다면, 남은 빈 공간을 이전 파일에 더해 강제로 여백을 없앱니다.
+            if (currentLineSpan > 0 && preferredSpan > remainingInLine) {
+                spans[i - 1] += remainingInLine
+                currentLineSpan = 0
+            }
+
+            spans[i] = preferredSpan
+            currentLineSpan += preferredSpan
+        }
+        
+        // 리스트의 가장 마지막 요소가 남긴 빈 공간도 강제로 끝까지 채움
+        if (currentLineSpan in 1 until totalGridCells) {
+            spans[items.lastIndex] += (totalGridCells - currentLineSpan)
+        }
+        spans
+    }
+
     LaunchedEffect(isAutoScroll, scrollDirection) {
         if (isAutoScroll) {
             while (isActive) {
@@ -282,38 +321,40 @@ fun OptimalReflowGrid(
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        LazyVerticalStaggeredGrid(
+        LazyVerticalGrid(
             state = gridState,
-            columns = StaggeredGridCells.Fixed(displayColumns),
+            columns = GridCells.Fixed(totalGridCells),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(0.dp),
-            verticalItemSpacing = 0.dp,
+            verticalArrangement = Arrangement.spacedBy(0.dp),
             horizontalArrangement = Arrangement.spacedBy(0.dp)
         ) {
-            items(
+            itemsIndexed(
                 items = items,
-                key = { it.id },
-                span = { item ->
-                    val scale = itemScales[item.id] ?: 1f
-                    if (scale > 1.2f || (item.isWide && displayColumns > 1) || (isCustomTab && activeVideoId == item.id)) {
-                        StaggeredGridItemSpan.FullLine 
-                    } else {
-                        StaggeredGridItemSpan.SingleLane 
-                    }
+                key = { _, item -> item.id },
+                span = { index, _ -> 
+                    val safeSpan = if (index < itemSpans.size) itemSpans[index] else (totalGridCells / displayColumns)
+                    GridItemSpan(maxOf(1, safeSpan.coerceAtMost(totalGridCells)))
                 }
-            ) { item ->
+            ) { _, item ->
                 val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
                 val currentScale = itemScales[item.id] ?: 1f
                 
-                DynamicRatioMediaCard(
-                    item = item,
-                    isPlaying = isPlaying,
-                    layoutScale = currentScale,
-                    displayColumns = displayColumns,
-                    onScaleChange = { newScale -> itemScales[item.id] = newScale },
-                    imageLoader = imageLoader,
-                    onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
-                )
+                // 확대/축소 시 세로 높이도 배율에 맞게 정확히 할당
+                val baseRowHeight = (360 / displayColumns).dp
+                val itemHeight = baseRowHeight * currentScale
+                
+                Box(Modifier.height(itemHeight).fillMaxWidth()) {
+                    DynamicRatioMediaCard(
+                        item = item,
+                        isPlaying = isPlaying,
+                        layoutScale = currentScale,
+                        onScaleChange = { newScale -> itemScales[item.id] = newScale },
+                        imageLoader = imageLoader,
+                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id },
+                        isCustomTab = isCustomTab // 커스텀 탭 여부 전달
+                    )
+                }
             }
         }
 
@@ -323,16 +364,17 @@ fun OptimalReflowGrid(
         ) {
             AnimatedVisibility(visible = gridState.firstVisibleItemIndex > 0) {
                 FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.size(48.dp)) { 
-                    Icon(Icons.Default.VerticalAlignTop, "맨 위로") 
+                    Icon(Icons.Default.VerticalAlignTop, "위로") 
                 }
             }
             AnimatedVisibility(visible = gridState.canScrollForward) {
                 FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(items.size - 1) } }, modifier = Modifier.size(48.dp)) { 
-                    Icon(Icons.Default.VerticalAlignBottom, "맨 아래로") 
+                    Icon(Icons.Default.VerticalAlignBottom, "아래로") 
                 }
             }
         }
 
+        // [요구사항 1] 커스텀 탭일 때만 하단 정밀 슬라이더 패널 노출
         if (isCustomTab && activeVideoId != null) {
             val scale = itemScales[activeVideoId] ?: 1f
             Column(
@@ -367,10 +409,10 @@ fun DynamicRatioMediaCard(
     item: GalleryMedia, 
     isPlaying: Boolean, 
     layoutScale: Float,
-    displayColumns: Int,
     onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
-    onPlayToggle: () -> Unit
+    onPlayToggle: () -> Unit,
+    isCustomTab: Boolean
 ) {
     val context = LocalContext.current
     var isZooming by remember { mutableStateOf(false) }
@@ -386,15 +428,10 @@ fun DynamicRatioMediaCard(
         }
     }
 
-    val isFullLine = layoutScale > 1.2f || (item.isWide && displayColumns > 1)
-    val widthMultiplier = if (isFullLine && displayColumns > 1) displayColumns.toFloat() else 1f
-    val targetRatio = ((item.ratio * widthMultiplier) / layoutScale).coerceIn(0.2f, 5f)
-
     Card(
         modifier = Modifier
-            .fillMaxWidth()
+            .fillMaxSize() // Box 크기에 맞게 채움
             .zIndex(if (isZooming || showInCardSlider) 1f else 0f)
-            .aspectRatio(targetRatio)
             .pointerInput(Unit) {
                 detectTwoFingerGesture(
                     onGestureStart = { 
@@ -464,30 +501,33 @@ fun DynamicRatioMediaCard(
                 )
             }
 
-            IconButton(
-                onClick = { showInCardSlider = !showInCardSlider },
-                modifier = Modifier.align(Alignment.TopStart)
-            ) {
-                Icon(Icons.Default.Tune, "정밀 조절", tint = Color.White.copy(alpha = 0.8f))
-            }
-
-            if (showInCardSlider) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.6f))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .padding(bottom = 20.dp)
+            // [요구사항 1] 정밀 제어 튜닝 버튼은 '커스텀' 탭에서만 보임
+            if (isCustomTab) {
+                IconButton(
+                    onClick = { showInCardSlider = !showInCardSlider },
+                    modifier = Modifier.align(Alignment.TopStart)
                 ) {
-                    Slider(
-                        value = visualScale,
-                        onValueChange = { 
-                            visualScale = it 
-                            onScaleChange(it) 
-                        },
-                        valueRange = 0.5f..4f
-                    )
+                    Icon(Icons.Default.Tune, "정밀 조절", tint = Color.White.copy(alpha = 0.8f))
+                }
+
+                if (showInCardSlider) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.6f))
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                            .padding(bottom = 20.dp)
+                    ) {
+                        Slider(
+                            value = visualScale,
+                            onValueChange = { 
+                                visualScale = it 
+                                onScaleChange(it) 
+                            },
+                            valueRange = 0.5f..4f
+                        )
+                    }
                 }
             }
         }
