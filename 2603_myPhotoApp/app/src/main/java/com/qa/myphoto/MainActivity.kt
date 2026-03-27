@@ -1,11 +1,11 @@
 package com.qa.myphoto
 
-
 import android.Manifest
 import android.content.ContentUris
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -60,6 +60,10 @@ data class GalleryMedia(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // [반영] 앱 실행 중 화면 꺼짐 방지 설정
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         val initialTabName = intent.getStringExtra("tab_name") ?: "전체"
         val initialAutoScroll = intent.getBooleanExtra("auto_scroll", false)
 
@@ -97,39 +101,51 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean) {
     val scope = rememberCoroutineScope()
     var isAutoScrollEnabled by remember { mutableStateOf(initialAutoScroll) }
 
-    // [핵심] 단말 + 온라인 통합 리스트 (상태 추적 가능)
     val totalMedia = remember { mutableStateListOf<GalleryMedia>() }
 
-    // 데이터 로드 로직
     LaunchedEffect(Unit) {
-        // 1. 단말 내 파일 먼저 로드 (내부 저장소 쿼리)
+        // 1. 단말 내 파일 로드 (해상도 정보 포함)
         launch(Dispatchers.IO) {
             val localItems = mutableListOf<GalleryMedia>()
-            val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.MIME_TYPE)
+            val projection = arrayOf(
+                MediaStore.MediaColumns._ID, 
+                MediaStore.MediaColumns.MIME_TYPE,
+                MediaStore.MediaColumns.WIDTH,
+                MediaStore.MediaColumns.HEIGHT
+            )
             context.contentResolver.query(MediaStore.Files.getContentUri("external"), projection, null, null, null)?.use { cursor ->
                 val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+                val widthCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.WIDTH)
+                val heightCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.HEIGHT)
+                
                 while (cursor.moveToNext()) {
                     val id = cursor.getLong(idCol)
+                    val width = cursor.getInt(widthCol)
+                    val height = cursor.getInt(heightCol)
                     val isVideo = cursor.getString(mimeCol).startsWith("video")
                     val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                    localItems.add(GalleryMedia("local_$id", uri, isVideo, false, if(id % 2L == 0L) 0.8f else 1.3f, "Local"))
+                    
+                    localItems.add(GalleryMedia(
+                        id = "local_$id", 
+                        uri = uri, 
+                        isVideo = isVideo, 
+                        isOnline = false, 
+                        ratio = if(width > 0 && height > 0) width.toFloat()/height else 1.0f,
+                        resolutionText = "${width}x${height}"
+                    ))
                 }
             }
-            withContext(Dispatchers.Main) {
-                totalMedia.addAll(localItems) // 단말 파일 즉시 반영
-            }
+            withContext(Dispatchers.Main) { totalMedia.addAll(localItems) }
         }
 
-        // 2. 온라인 파일 비동기 로드 (네트워크 통신 모사)
+        // 2. 온라인 파일 비동기 추가
         launch(Dispatchers.IO) {
-            delay(2000) // 네트워크 지연 가정
-            val remoteItems = List(15) { i ->
-                GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.0f, "Online")
+            delay(1500)
+            val remoteItems = List(10) { i ->
+                GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.77f, "1920x1080")
             }
-            withContext(Dispatchers.Main) {
-                totalMedia.addAll(remoteItems) // 온라인 파일 로드 완료 시 자동 추가
-            }
+            withContext(Dispatchers.Main) { totalMedia.addAll(remoteItems) }
         }
     }
 
@@ -237,8 +253,19 @@ fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: Im
                     IconButton(onClick = onPlayClick) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(40.dp)) }
                 }
             }
-            Surface(color = Color.Black.copy(0.4f), modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
-                Text(text = item.resolutionText, color = Color.White, fontSize = 9.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+            
+            // 좌측 하단 해상도 표시
+            Surface(
+                color = Color.Black.copy(alpha = 0.5f),
+                shape = MaterialTheme.shapes.extraSmall,
+                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+            ) {
+                Text(text = item.resolutionText, color = Color.White, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 3.dp, vertical = 1.dp))
+            }
+            
+            // 우측 하단 타입 표시 (단말/온라인)
+            Surface(color = Color.White.copy(alpha = 0.2f), modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
+                Text(text = if(item.isOnline) "Cloud" else "Local", color = Color.White, fontSize = 8.sp, modifier = Modifier.padding(2.dp))
             }
         }
     }
@@ -252,3 +279,4 @@ fun VideoPlayerCore(uri: Uri) {
     DisposableEffect(Unit) { onDispose { exoPlayer.release() } }
     AndroidView(factory = { PlayerView(it).apply { player = exoPlayer; useController = false; resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM; setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) } }, modifier = Modifier.fillMaxSize())
 }
+
