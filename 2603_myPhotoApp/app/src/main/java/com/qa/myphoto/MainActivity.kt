@@ -35,10 +35,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -246,16 +249,12 @@ fun OptimalReflowGrid(
     
     val totalGridCells = 120 
 
-    // [핵심 해결] 가로 공백(Span) 채우기 및 세로 공백(Row Max Height) 채우기 연산
-    val (itemSpans, rowMaxScales) = remember(items, displayColumns, itemScales.toMap()) {
-        if (items.isEmpty()) return@remember Pair(IntArray(0), FloatArray(0))
+    val itemSpans = remember(items, displayColumns, itemScales.toMap()) {
+        if (items.isEmpty()) return@remember IntArray(0)
         
         val spans = IntArray(items.size)
-        val maxScales = FloatArray(items.size) // 각 파일이 속한 줄(Row)의 최대 높이를 저장
-        
         var currentLineSpan = 0
         val baseSpan = totalGridCells / displayColumns
-        val currentRowIndices = mutableListOf<Int>() // 현재 줄에 속해있는 파일들의 인덱스 추적
         
         for (i in items.indices) {
             val scale = itemScales[items[i].id] ?: 1f
@@ -268,38 +267,19 @@ fun OptimalReflowGrid(
 
             val remainingInLine = totalGridCells - currentLineSpan
 
-            // 다음 파일이 들어갈 자리가 부족하면(줄바꿈 발생) 이전 파일의 가로를 끝까지 늘려 덮음
             if (currentLineSpan > 0 && preferredSpan > remainingInLine) {
                 spans[i - 1] += remainingInLine
-                
-                // 줄이 끝났으므로, 해당 줄에 있는 파일들 중 가장 높이가 큰(scale이 높은) 값을 찾아냅니다.
-                val maxScaleInRow = currentRowIndices.maxOfOrNull { itemScales[items[it].id] ?: 1f } ?: 1f
-                // 그 줄에 있는 모든 파일의 세로 높이를 가장 높은 값으로 통일시켜 아래 빈 공간을 강제로 채웁니다.
-                for (idx in currentRowIndices) {
-                    maxScales[idx] = maxScaleInRow
-                }
-                
-                currentRowIndices.clear()
                 currentLineSpan = 0
             }
 
             spans[i] = preferredSpan
-            currentRowIndices.add(i)
             currentLineSpan += preferredSpan
         }
         
-        // 마지막 줄의 가로/세로 빈 공간 처리
         if (currentLineSpan in 1 until totalGridCells) {
             spans[items.lastIndex] += (totalGridCells - currentLineSpan)
         }
-        if (currentRowIndices.isNotEmpty()) {
-            val maxScaleInRow = currentRowIndices.maxOfOrNull { itemScales[items[it].id] ?: 1f } ?: 1f
-            for (idx in currentRowIndices) {
-                maxScales[idx] = maxScaleInRow
-            }
-        }
-        
-        Pair(spans, maxScales)
+        spans
     }
 
     LaunchedEffect(isAutoScroll, scrollDirection) {
@@ -352,28 +332,22 @@ fun OptimalReflowGrid(
                     val safeSpan = if (index < itemSpans.size) itemSpans[index] else (totalGridCells / displayColumns)
                     GridItemSpan(maxOf(1, safeSpan.coerceAtMost(totalGridCells)))
                 }
-            ) { index, item ->
+            ) { _, item ->
                 val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
+                val currentScale = itemScales[item.id] ?: 1f
                 
-                // 파일 고유의 확대/축소 스케일
-                val itemScale = itemScales[item.id] ?: 1f
-                // 줄(Row) 내에서 가장 높은 스케일 (빈 공간 채우기용)
-                val rowMaxScale = if (index < rowMaxScales.size) rowMaxScales[index] else itemScale
-                
-                // 줄에 속한 모든 파일은 강제로 가장 높은 높이로 늘어납니다.
                 val baseRowHeight = (360 / displayColumns).dp
-                val itemHeight = baseRowHeight * rowMaxScale
+                val itemHeight = baseRowHeight * currentScale
                 
                 Box(Modifier.height(itemHeight).fillMaxWidth()) {
                     DynamicRatioMediaCard(
                         item = item,
                         isPlaying = isPlaying,
-                        layoutScale = rowMaxScale,  // 레이아웃 자체의 강제 높이
-                        itemScale = itemScale,      // 튜닝 슬라이더가 기억해야 할 실제 줌 배율
+                        layoutScale = currentScale,
+                        displayColumns = displayColumns,
                         onScaleChange = { newScale -> itemScales[item.id] = newScale },
                         imageLoader = imageLoader,
-                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id },
-                        isCustomTab = isCustomTab 
+                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
                     )
                 }
             }
@@ -429,21 +403,19 @@ fun DynamicRatioMediaCard(
     item: GalleryMedia, 
     isPlaying: Boolean, 
     layoutScale: Float,
-    itemScale: Float,
+    displayColumns: Int,
     onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
-    onPlayToggle: () -> Unit,
-    isCustomTab: Boolean
+    onPlayToggle: () -> Unit
 ) {
     val context = LocalContext.current
     var isZooming by remember { mutableStateOf(false) }
     var visualScale by remember { mutableFloatStateOf(layoutScale) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     
-    var showInCardSlider by remember { mutableStateOf(false) }
+    // 비디오 음소거 기본값 (true)
     var isMuted by remember { mutableStateOf(true) }
 
-    // 부모 레이아웃 렌더링 확정 시 시각 효과 동기화
     LaunchedEffect(layoutScale) {
         if (!isZooming) {
             visualScale = layoutScale
@@ -451,16 +423,18 @@ fun DynamicRatioMediaCard(
         }
     }
 
+    val isFullLine = layoutScale > 1.2f || (item.isWide && displayColumns > 1)
+    val widthMultiplier = if (isFullLine && displayColumns > 1) displayColumns.toFloat() else 1f
+    val targetRatio = ((item.ratio * widthMultiplier) / layoutScale).coerceIn(0.2f, 5f)
+
     Card(
         modifier = Modifier
-            // Box에서 할당해준 가로(span)/세로(itemHeight) 공간을 빈틈없이 채웁니다. (aspectRatio 제거됨)
             .fillMaxSize() 
-            .zIndex(if (isZooming || showInCardSlider) 1f else 0f)
+            .zIndex(if (isZooming) 1f else 0f)
             .pointerInput(Unit) {
                 detectTwoFingerGesture(
                     onGestureStart = { 
                         isZooming = true
-                        showInCardSlider = false
                     },
                     onGesture = { pan, zoom ->
                         visualScale = (visualScale * zoom).coerceIn(0.5f, 4f)
@@ -505,57 +479,37 @@ fun DynamicRatioMediaCard(
                         Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(48.dp)) 
                     }
                 }
+                
+                // [요구사항 1] 더 작고 앙증맞아진 음소거 아이콘
                 IconButton(
                     onClick = { isMuted = !isMuted },
-                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp)
+                    modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(28.dp)
                 ) {
                     Icon(
                         imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp, 
                         contentDescription = if (isMuted) "음소거 해제" else "음소거", 
                         tint = Color.White.copy(0.9f), 
-                        modifier = Modifier.size(24.dp)
+                        modifier = Modifier.size(18.dp) // 아이콘 크기 축소
                     )
                 }
             }
             
-            Surface(
-                color = Color.Black.copy(alpha = 0.5f), 
-                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+            // [요구사항 2] 배경색(Surface)이 제거되고 텍스트 그림자가 추가된 해상도 텍스트
+            Box(
+                modifier = Modifier.align(Alignment.BottomStart).padding(6.dp)
             ) {
                 Text(
                     text = item.resolutionText, 
                     color = Color.White, 
-                    fontSize = 8.sp, 
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                )
-            }
-
-            if (isCustomTab) {
-                IconButton(
-                    onClick = { showInCardSlider = !showInCardSlider },
-                    modifier = Modifier.align(Alignment.TopStart)
-                ) {
-                    Icon(Icons.Default.Tune, "정밀 조절", tint = Color.White.copy(alpha = 0.8f))
-                }
-
-                if (showInCardSlider) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .background(Color.Black.copy(alpha = 0.6f))
-                            .padding(horizontal = 16.dp, vertical = 8.dp)
-                            .padding(bottom = 20.dp)
-                    ) {
-                        Slider(
-                            value = itemScale, // 자신의 고유 스케일 값을 조절
-                            onValueChange = { 
-                                onScaleChange(it) 
-                            },
-                            valueRange = 0.5f..4f
+                    fontSize = 10.sp, 
+                    style = TextStyle(
+                        shadow = androidx.compose.ui.graphics.Shadow(
+                            color = Color.Black.copy(alpha = 0.8f),
+                            offset = Offset(1f, 1f),
+                            blurRadius = 4f
                         )
-                    }
-                }
+                    )
+                )
             }
         }
     }
@@ -603,13 +557,23 @@ fun VideoPlayerCore(uri: Uri, isMuted: Boolean) {
             setMediaItem(MediaItem.fromUri(uri))
             repeatMode = Player.REPEAT_MODE_ONE
             volume = if (isMuted) 0f else 1f
+            
+            // [요구사항 4] 음소거 시 오디오 트랙 자체를 비활성화 (리소스 절약 및 포커스 충돌 방지)
+            trackSelectionParameters = trackSelectionParameters.buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, isMuted)
+                .build()
+                
             prepare()
             playWhenReady = true
         }
     }
 
+    // 재생 중 음소거 상태가 변하면 볼륨 및 트랙 활성화 여부 즉시 업데이트
     LaunchedEffect(isMuted) {
         exoPlayer.volume = if (isMuted) 0f else 1f
+        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, isMuted)
+            .build()
     }
 
     DisposableEffect(uri) { onDispose { exoPlayer.release() } }
