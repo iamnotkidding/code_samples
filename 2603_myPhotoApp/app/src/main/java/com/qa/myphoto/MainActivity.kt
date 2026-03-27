@@ -118,8 +118,6 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
                     val ratio = w.toFloat() / h
                     val isVideo = (cursor.getString(mimeCol) ?: "").startsWith("video")
                     val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                    
-                    // 가로 비율이 1.5 이상이면 와이드 파일로 분류
                     localItems.add(GalleryMedia("local_$id", uri, isVideo, false, ratio, "${w}x${h}", ratio > 1.5f))
                 }
             }
@@ -143,25 +141,35 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
             }
         }
     ) { padding ->
-        HorizontalPager(state = pagerState, modifier = Modifier.padding(padding).fillMaxSize()) { pageIdx ->
+        // [반영] 한 손가락 좌우 스와이프로 탭 이동
+        HorizontalPager(
+            state = pagerState, 
+            modifier = Modifier.padding(padding).fillMaxSize(),
+            userScrollEnabled = true 
+        ) { pageIdx ->
             val filtered = when (pageIdx) {
                 1 -> totalMedia.filter { !it.isVideo }
                 2 -> totalMedia.filter { it.isVideo }
                 else -> totalMedia
             }
-            ComfortableGaplessGrid(filtered, isAutoScrollEnabled, videoImageLoader, initialZoom)
+            ComfortableGrid(filtered, isAutoScrollEnabled, videoImageLoader, initialZoom)
         }
     }
 }
 
 @Composable
-fun ComfortableGaplessGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialColumns: Int) {
+fun ComfortableGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialColumns: Int) {
     val gridState = rememberLazyStaggeredGridState()
+    val scope = rememberCoroutineScope()
+    
+    // [반영] 두 손가락 줌으로 레이아웃 레벨(열 개수) 변경
     var columnCount by remember { mutableFloatStateOf(initialColumns.toFloat()) }
     val displayColumns = columnCount.toInt().coerceIn(1, 5)
+    
     var scrollDirection by remember { mutableIntStateOf(1) }
     var manualPlayId by remember { mutableStateOf<String?>(null) }
 
+    // 자동 왕복 스크롤
     LaunchedEffect(isEnabled, scrollDirection) {
         if (isEnabled) {
             while (isActive) {
@@ -173,6 +181,7 @@ fun ComfortableGaplessGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
         }
     }
 
+    // 화면 중앙 가시성 기반 자동 재생
     val activeVideoId by remember {
         derivedStateOf {
             val layoutInfo = gridState.layoutInfo
@@ -186,29 +195,36 @@ fun ComfortableGaplessGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) { // 배경을 검은색으로 하여 흰 공간 방지
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         LazyVerticalStaggeredGrid(
             state = gridState,
             columns = StaggeredGridCells.Fixed(displayColumns),
             modifier = Modifier
                 .fillMaxSize()
+                // [반영] 사진/동영상 위에서도 동작하는 줌 제스처
                 .pointerInput(Unit) {
                     detectTransformGestures { _, _, zoom, _ ->
                         columnCount = (columnCount / zoom).coerceIn(1f, 5.9f)
                     }
                 },
-            contentPadding = PaddingValues(0.dp), // 간격 제거
-            verticalItemSpacing = 0.dp,
-            horizontalArrangement = Arrangement.spacedBy(0.dp)
+            contentPadding = PaddingValues(1.dp),
+            verticalItemSpacing = 1.dp,
+            horizontalArrangement = Arrangement.spacedBy(1.dp)
         ) {
             items(items, key = { it.id }, span = { item ->
-                // 가로 크기 다양화: 와이드 파일은 가로 전체 차지 유도 (칸수가 2개 이상일 때)
+                // 가로 크기 다양화 (비율 기반)
                 if (item.isWide && displayColumns > 1) StaggeredGridItemSpan.FullLine else StaggeredGridItemSpan.SingleLane
             }) { item ->
                 val isPlaying = item.id == manualPlayId || (manualPlayId == null && item.id == activeVideoId)
                 GaplessMediaCard(item, isPlaying, imageLoader) {
                     manualPlayId = if (manualPlayId == item.id) null else item.id
                 }
+            }
+        }
+
+        if (gridState.firstVisibleItemIndex > 2) {
+            FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(44.dp)) {
+                Icon(Icons.Default.ArrowUpward, null)
             }
         }
     }
@@ -218,48 +234,27 @@ fun ComfortableGaplessGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
 @Composable
 fun GaplessMediaCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: ImageLoader, onPlayClick: () -> Unit) {
     val context = LocalContext.current
-    
-    // 강제로 화면 비율에 맞춰 확장 (흰 공간 제거 핵심)
-    Card(
-        modifier = Modifier.fillMaxWidth().wrapContentHeight(), 
-        shape = RectangleShape,
-        colors = CardDefaults.cardColors(containerColor = Color.Black)
-    ) {
+    Card(modifier = Modifier.fillMaxWidth().wrapContentHeight(), shape = RectangleShape) {
         Box(modifier = Modifier.aspectRatio(item.ratio), contentAlignment = Alignment.Center) {
-            // 썸네일을 항상 배경에 깔아두어 플레이어 전환 시 깜빡임 방지
+            // [깜빡임 해결] 썸네일을 항상 배경에 깔아둠
             AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(item.uri)
-                    .memoryCachePolicy(CachePolicy.ENABLED)
-                    .crossfade(200) // 부드러운 전환
-                    .build(),
+                model = ImageRequest.Builder(context).data(item.uri).memoryCachePolicy(CachePolicy.ENABLED).crossfade(200).build(),
                 imageLoader = imageLoader,
                 contentDescription = null,
-                contentScale = ContentScale.Crop, // 빈 공간 없이 채움
-                modifier = Modifier.fillMaxSize()
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().background(Color.DarkGray)
             )
             
             if (item.isVideo) {
                 if (isPlaying) {
                     VideoPlayerCore(item.uri)
                 } else {
-                    Icon(
-                        Icons.Default.VideoCameraBack, null, 
-                        tint = Color.White.copy(0.7f), 
-                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).size(20.dp)
-                    )
-                    IconButton(onClick = onPlayClick) {
-                        Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(40.dp))
-                    }
+                    Icon(Icons.Default.VideoCameraBack, null, tint = Color.White.copy(0.7f), modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(18.dp))
+                    IconButton(onClick = onPlayClick) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(32.dp)) }
                 }
             }
-            
-            // 해상도 표시
-            Surface(
-                color = Color.Black.copy(alpha = 0.5f), 
-                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
-            ) {
-                Text(text = item.resolutionText, color = Color.White, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 4.dp))
+            Surface(color = Color.Black.copy(alpha = 0.4f), modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)) {
+                Text(text = item.resolutionText, color = Color.White, fontSize = 7.sp, modifier = Modifier.padding(horizontal = 3.dp))
             }
         }
     }
@@ -284,8 +279,8 @@ fun VideoPlayerCore(uri: Uri) {
             PlayerView(ctx).apply {
                 player = exoPlayer
                 useController = false
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM // 비디오도 꽉 채움
-                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) // 준비 중 검은 화면 방지
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) // [깜빡임 해결]
             }
         },
         modifier = Modifier.fillMaxSize()
