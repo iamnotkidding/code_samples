@@ -55,8 +55,7 @@ data class GalleryMedia(
     val isVideo: Boolean,
     val isOnline: Boolean,
     val ratio: Float,
-    val resolutionText: String,
-    val span: Int = 1 // 가로 점유 칸 수 (1 or 2)
+    val resolutionText: String
 )
 
 class MainActivity : ComponentActivity() {
@@ -64,9 +63,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // Intent 파라미터: tab_name, auto_scroll, zoom_level(가로 파일 개수)
         val initialTabName = intent.getStringExtra("tab_name") ?: "전체"
         val initialAutoScroll = intent.getBooleanExtra("auto_scroll", false)
-        val initialZoomLevel = intent.getIntExtra("zoom_level", 3).coerceIn(1, 5)
+        val initialZoomLevel = intent.getIntExtra("zoom_level", 3).coerceIn(1, 6)
 
         setContent {
             MaterialTheme {
@@ -105,6 +105,7 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
     val totalMedia = remember { mutableStateListOf<GalleryMedia>() }
 
     LaunchedEffect(Unit) {
+        // 단말 로컬 파일 로드
         launch(Dispatchers.IO) {
             val localItems = mutableListOf<GalleryMedia>()
             val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.WIDTH, MediaStore.MediaColumns.HEIGHT)
@@ -119,18 +120,15 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
                     val h = cursor.getInt(hCol).coerceAtLeast(1)
                     val isVideo = cursor.getString(mimeCol).startsWith("video")
                     val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                    // 가로가 특히 긴 경우 span을 2로 설정하여 가로 크기 다양화
-                    val span = if (w > h * 1.5 && id % 3 == 0L) 2 else 1
-                    localItems.add(GalleryMedia("local_$id", uri, isVideo, false, w.toFloat()/h, "${w}x${h}", span))
+                    localItems.add(GalleryMedia("local_$id", uri, isVideo, false, w.toFloat()/h, "${w}x${h}"))
                 }
             }
             withContext(Dispatchers.Main) { totalMedia.addAll(localItems) }
         }
+        // 온라인 파일 로드 (가상)
         launch(Dispatchers.IO) {
-            delay(1000)
-            val remoteItems = List(8) { i -> 
-                GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.77f, "1920x1080", 1) 
-            }
+            delay(1200)
+            val remoteItems = List(6) { i -> GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.77f, "1920x1080") }
             withContext(Dispatchers.Main) { totalMedia.addAll(remoteItems) }
         }
     }
@@ -151,11 +149,10 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
             }
         }
     ) { padding ->
-        // [반영 2] 한 손가락 좌우 스와이프로 탭 이동 (HorizontalPager 기본 동작 활용)
+        // [반영] 한 손가락 좌우 스와이프로 탭 이동 보장
         HorizontalPager(
             state = pagerState, 
-            modifier = Modifier.padding(padding).fillMaxSize(),
-            beyondViewportPageCount = 1
+            modifier = Modifier.padding(padding).fillMaxSize()
         ) { pageIdx ->
             val filtered = when (pageIdx) {
                 1 -> totalMedia.filter { !it.isVideo }
@@ -164,39 +161,44 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
                 4 -> totalMedia.filter { it.isOnline }
                 else -> totalMedia
             }
-            PersistentAutoLoopGrid(filtered, isAutoScrollEnabled, imageLoader = videoImageLoader, initialZoom = initialZoom)
+            ComfortableAutoGrid(filtered, isAutoScrollEnabled, videoImageLoader, initialZoom)
         }
     }
 }
 
 @Composable
-fun PersistentAutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialZoom: Int) {
+fun ComfortableAutoGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialZoom: Int) {
     val gridState = rememberLazyStaggeredGridState()
     val scope = rememberCoroutineScope()
+    
+    // [반영] 확대 축소 레벨 = 가로 파일 개수
     var columnCount by remember { mutableFloatStateOf(initialZoom.toFloat()) }
-    val displayColumns = columnCount.toInt().coerceIn(1, 5)
+    val displayColumns = columnCount.toInt().coerceIn(1, 6)
+
     var scrollDirection by remember { mutableIntStateOf(1) }
     var manualPlayId by remember { mutableStateOf<String?>(null) }
 
+    // 자동 왕복 스크롤
     LaunchedEffect(isEnabled, scrollDirection) {
         if (isEnabled) {
             while (true) {
                 if (scrollDirection == 1 && !gridState.canScrollForward) scrollDirection = -1
                 else if (scrollDirection == -1 && !gridState.canScrollBackward) scrollDirection = 1
-                gridState.scrollBy(2.0f * scrollDirection)
+                gridState.scrollBy(2.2f * scrollDirection)
                 delay(16)
             }
         }
     }
 
+    // 화면 가시성 기반 자동 재생 로직 (Comfortable 유지)
     val activeVideoId by remember {
         derivedStateOf {
             val layoutInfo = gridState.layoutInfo
             val visibleItems = layoutInfo.visibleItemsInfo
             if (visibleItems.isEmpty()) return@derivedStateOf null
             visibleItems.firstOrNull { info ->
-                val isVideo = items.getOrNull(info.index)?.isVideo == true
-                isVideo && info.offset.y >= layoutInfo.viewportStartOffset && (info.offset.y + info.size.height) <= layoutInfo.viewportEndOffset
+                val isFullyVisible = info.offset.y >= layoutInfo.viewportStartOffset && (info.offset.y + info.size.height) <= layoutInfo.viewportEndOffset
+                isFullyVisible && items.getOrNull(info.index)?.isVideo == true
             }?.key.toString()
         }
     }
@@ -204,24 +206,22 @@ fun PersistentAutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
     Box(modifier = Modifier.fillMaxSize()) {
         LazyVerticalStaggeredGrid(
             state = gridState,
-            // [반영 3] 세로 뿐만 아니라 가로 크기도 다양하게 반영 (StaggeredGrid의 특성 및 Span 활용)
+            // [반영] Comfortable Layout 적용 (지그재그 배치)
             columns = StaggeredGridCells.Fixed(displayColumns),
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
                     detectTransformGestures { _, _, zoom, _ ->
+                        // 줌 인(벌리기) 하면 파일 개수 감소, 줌 아웃(오므리기) 하면 파일 개수 증가
                         val newCount = columnCount / zoom
-                        columnCount = newCount.coerceIn(1f, 5.9f)
+                        columnCount = newCount.coerceIn(1f, 6.9f)
                     }
                 },
             contentPadding = PaddingValues(2.dp),
             verticalItemSpacing = 2.dp,
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            items(items, key = { it.id }, span = { item -> 
-                // 특정 조건의 아이템은 가로로 2칸 차지하게 하여 가로 크기 다양화
-                StaggeredGridItemSpan.FullLine.takeIf { item.span > 1 && displayColumns > 1 } ?: StaggeredGridItemSpan.SingleLane
-            }) { item ->
+            items(items, key = { it.id }) { item ->
                 val isPlaying = item.id == manualPlayId || (manualPlayId == null && item.id == activeVideoId)
                 ComfortableMediaCard(item, isPlaying, imageLoader) { 
                     manualPlayId = if (manualPlayId == item.id) null else item.id 
@@ -229,15 +229,15 @@ fun PersistentAutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
             }
         }
 
-        // 퀵 이동 버튼
+        // 퀵 네비게이션 버튼
         Column(modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             AnimatedVisibility(visible = gridState.firstVisibleItemIndex > 0) {
-                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.size(44.dp)) {
+                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.size(42.dp)) {
                     Icon(Icons.Default.ArrowUpward, null)
                 }
             }
             AnimatedVisibility(visible = gridState.canScrollForward) {
-                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(items.size - 1) } }, modifier = Modifier.size(44.dp)) {
+                FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(items.size - 1) } }, modifier = Modifier.size(42.dp)) {
                     Icon(Icons.Default.ArrowDownward, null)
                 }
             }
@@ -249,7 +249,7 @@ fun PersistentAutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageL
 @Composable
 fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: ImageLoader, onPlayClick: () -> Unit) {
     val context = LocalContext.current
-    Card(modifier = Modifier.fillMaxWidth(), shape = MaterialTheme.shapes.extraSmall) {
+    Card(modifier = Modifier.fillMaxWidth().wrapContentHeight(), shape = MaterialTheme.shapes.extraSmall) {
         Box(modifier = Modifier.aspectRatio(item.ratio), contentAlignment = Alignment.Center) {
             if (item.isVideo && isPlaying) {
                 VideoPlayerCore(item.uri)
@@ -267,18 +267,14 @@ fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: Im
                 }
             }
 
-            // 좌측 하단 해상도
+            // 해상도 표시 (좌측 하단)
             Surface(color = Color.Black.copy(0.5f), shape = MaterialTheme.shapes.extraSmall, modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)) {
                 Text(text = item.resolutionText, color = Color.White, fontSize = 7.sp, modifier = Modifier.padding(horizontal = 3.dp, vertical = 1.dp))
             }
 
-            // [반반영 1] 온라인 파일만 표시 (로컬 표시 제거)
+            // 온라인 전용 표시 (우측 하단)
             if (item.isOnline) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primary.copy(0.8f),
-                    shape = MaterialTheme.shapes.extraSmall,
-                    modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)
-                ) {
+                Surface(color = MaterialTheme.colorScheme.primary.copy(0.8f), shape = MaterialTheme.shapes.extraSmall, modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
                     Text(text = "온라인", color = Color.White, fontSize = 7.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp))
                 }
             }
