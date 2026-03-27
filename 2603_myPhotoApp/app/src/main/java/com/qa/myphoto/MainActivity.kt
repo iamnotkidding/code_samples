@@ -2,18 +2,14 @@ package com.qa.myphoto
 
 
 import android.Manifest
-import android.content.ContentUris
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
-import androidx.compose.animation.core.animateIntAsState
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
@@ -23,6 +19,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.VideoCameraBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -51,7 +48,8 @@ data class GalleryMedia(
     val uri: Uri,
     val isVideo: Boolean,
     val isOnline: Boolean,
-    val ratio: Float
+    val ratio: Float,
+    val resolutionText: String
 )
 
 class MainActivity : ComponentActivity() {
@@ -59,79 +57,79 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                PermissionGate { MainAutoLoopGallery() }
+                PermissionCheck {
+                    // 알림창(Status Bar) 아래 배치
+                    Surface(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+                        MainGalleryApp()
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun PermissionGate(content: @Composable () -> Unit) {
+fun PermissionCheck(content: @Composable () -> Unit) {
     var granted by remember { mutableStateOf(false) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         granted = it.values.all { g -> g }
     }
     LaunchedEffect(Unit) {
-        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
-        } else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-        launcher.launch(perms)
+        launcher.launch(arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO))
     }
     if (granted) content() else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun MainAutoLoopGallery() {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
+fun MainGalleryApp() {
     val tabs = listOf("전체", "사진", "동영상", "단말", "온라인")
     val pagerState = rememberPagerState(pageCount = { tabs.size })
+    val scope = rememberCoroutineScope()
+    var isAutoScrollEnabled by remember { mutableStateOf(false) }
 
-    // 자동 스크롤 활성화 여부
-    var isAutoScrollActive by remember { mutableStateOf(false) }
-
-    // 단말 파일 로드
-    val deviceMedia = remember { mutableStateListOf<GalleryMedia>() }
-    LaunchedEffect(Unit) {
-        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.MIME_TYPE)
-        context.contentResolver.query(MediaStore.Files.getContentUri("external"), projection, null, null, null)?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-            val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
-            while (cursor.moveToNext()) {
-                val id = cursor.getLong(idCol)
-                val isVideo = cursor.getString(mimeCol).startsWith("video")
-                val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                deviceMedia.add(GalleryMedia("local_$id", uri, isVideo, false, if(id % 2 == 0L) 0.8f else 1.3f))
-            }
+    val totalMedia = remember {
+        List(100) { i -> 
+            val r = if(i % 3 == 0) 0.8f else 1.3f
+            GalleryMedia(
+                id = "m_$i", 
+                uri = Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), 
+                isVideo = i % 5 == 0, 
+                isOnline = i % 2 == 0, 
+                ratio = r,
+                resolutionText = if(r < 1f) "1080:1920" else "1920:1080"
+            )
         }
     }
-
-    val onlineMedia = remember {
-        List(10) { i -> GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.0f) }
-    }
-    val totalMedia = (deviceMedia + onlineMedia).shuffled()
 
     Scaffold(
         topBar = {
             Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
                 ScrollableTabRow(selectedTabIndex = pagerState.currentPage, edgePadding = 16.dp) {
                     tabs.forEachIndexed { i, title ->
-                        Tab(selected = pagerState.currentPage == i, onClick = { scope.launch { pagerState.animateScrollToPage(i) } }) {
-                            Text(title, fontSize = 16.sp, modifier = Modifier.padding(14.dp))
+                        Tab(
+                            selected = pagerState.currentPage == i, 
+                            onClick = { scope.launch { pagerState.animateScrollToPage(i) } }
+                        ) {
+                            Text(title, fontSize = 15.sp, modifier = Modifier.padding(12.dp))
                         }
                     }
                 }
                 Button(
-                    onClick = { isAutoScrollActive = !isAutoScrollActive },
-                    modifier = Modifier.fillMaxWidth().padding(8.dp)
+                    onClick = { isAutoScrollEnabled = !isAutoScrollEnabled },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
                 ) {
-                    Text(if (isAutoScrollActive) "자동 왕복 스크롤 중지" else "자동 왕복 스크롤 시작")
+                    Text(if (isAutoScrollEnabled) "자동 스크롤 중지" else "자동 스크롤 시작")
                 }
             }
         }
     ) { padding ->
-        HorizontalPager(state = pagerState, modifier = Modifier.padding(padding)) { pageIdx ->
+        // [반영] 좌우 스와이프로 탭 전환 지원
+        HorizontalPager(
+            state = pagerState, 
+            modifier = Modifier.padding(padding).fillMaxSize(),
+            userScrollEnabled = true 
+        ) { pageIdx ->
             val filtered = when (pageIdx) {
                 1 -> totalMedia.filter { !it.isVideo }
                 2 -> totalMedia.filter { it.isVideo }
@@ -139,56 +137,59 @@ fun MainAutoLoopGallery() {
                 4 -> totalMedia.filter { it.isOnline }
                 else -> totalMedia
             }
-            AutoLoopGrid(filtered, isAutoScrollActive)
+            PersistentAutoLoopGrid(filtered, isAutoScrollEnabled)
         }
     }
 }
 
 @Composable
-fun AutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean) {
+fun PersistentAutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean) {
     val gridState = rememberLazyStaggeredGridState()
     var columnCount by remember { mutableIntStateOf(3) }
-    var zoomScale by remember { mutableFloatStateOf(1f) }
-    val animatedCols by animateIntAsState(columnCount, label = "cols")
-
-    // --- [핵심: 자동 왕복 스크롤 로직] ---
-    var scrollDirection by remember { mutableIntStateOf(1) } // 1: 아래, -1: 위
+    var scrollDirection by remember { mutableIntStateOf(1) } 
+    var manualPlayId by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(isEnabled, scrollDirection) {
         if (isEnabled) {
             while (true) {
-                // 1. 끝에 도달했는지 체크하여 방향 반전
-                if (scrollDirection == 1 && !gridState.canScrollForward) {
-                    scrollDirection = -1 // 맨 아래면 위로
-                } else if (scrollDirection == -1 && !gridState.canScrollBackward) {
-                    scrollDirection = 1 // 맨 위면 아래로
-                }
-
-                // 2. 실제 스크롤 수행
-                gridState.scrollBy(4f * scrollDirection)
+                if (scrollDirection == 1 && !gridState.canScrollForward) scrollDirection = -1
+                else if (scrollDirection == -1 && !gridState.canScrollBackward) scrollDirection = 1
+                gridState.scrollBy(2.5f * scrollDirection)
                 delay(16)
             }
         }
     }
 
-    // 자동 재생 ID 감지
-    val autoPlayId by remember {
+    // [반영] 화면에 '전체'가 보이는 동영상 파일 자동 재생 대상 선택
+    val activeVideoId by remember {
         derivedStateOf {
-            gridState.layoutInfo.visibleItemsInfo
-                .firstOrNull { info -> items.getOrNull(info.index)?.isVideo == true }?.key.toString()
+            val layoutInfo = gridState.layoutInfo
+            val visibleItems = layoutInfo.visibleItemsInfo
+            if (visibleItems.isEmpty()) return@derivedStateOf null
+            
+            val viewportStart = layoutInfo.viewportStartOffset
+            val viewportEnd = layoutInfo.viewportEndOffset
+
+            // 화면 안에 잘림 없이 완전히 들어온 동영상들 중 첫 번째 선택
+            visibleItems.firstOrNull { info ->
+                val itemStart = info.offset.y
+                val itemEnd = info.offset.y + info.size.height
+                val isFullyVisible = itemStart >= viewportStart && itemEnd <= viewportEnd
+                val isVideo = items.getOrNull(info.index)?.isVideo == true
+                isFullyVisible && isVideo
+            }?.key.toString()
         }
     }
 
     LazyVerticalStaggeredGrid(
         state = gridState,
-        columns = StaggeredGridCells.Fixed(animatedCols),
+        columns = StaggeredGridCells.Fixed(columnCount),
         modifier = Modifier
             .fillMaxSize()
             .pointerInput(Unit) {
                 detectTransformGestures { _, _, zoom, _ ->
-                    zoomScale *= zoom
-                    if (zoomScale > 1.2f && columnCount > 1) { columnCount--; zoomScale = 1f }
-                    else if (zoomScale < 0.8f && columnCount < 5) { columnCount++; zoomScale = 1f }
+                    if (zoom > 1.2f && columnCount > 1) columnCount--
+                    else if (zoom < 0.8f && columnCount < 5) columnCount++
                 }
             },
         contentPadding = PaddingValues(2.dp),
@@ -196,18 +197,23 @@ fun AutoLoopGrid(items: List<GalleryMedia>, isEnabled: Boolean) {
         horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         items(items, key = { it.id }) { item ->
-            ComfortableMediaCard(item, isPlaying = item.id == autoPlayId)
+            val isPlaying = item.id == manualPlayId || (manualPlayId == null && item.id == activeVideoId)
+            ComfortableMediaCard(
+                item = item, 
+                isPlaying = isPlaying,
+                onPlayClick = { manualPlayId = if (manualPlayId == item.id) null else item.id }
+            )
         }
     }
 }
 
 @OptIn(UnstableApi::class)
 @Composable
-fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean) {
+fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean, onPlayClick: () -> Unit) {
     val context = LocalContext.current
     Card(
         modifier = Modifier.fillMaxWidth().wrapContentHeight(),
-        shape = androidx.compose.foundation.shape.RoundedCornerShape(2.dp)
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp)
     ) {
         Box(modifier = Modifier.aspectRatio(item.ratio), contentAlignment = Alignment.Center) {
             if (item.isVideo && isPlaying) {
@@ -218,7 +224,27 @@ fun ComfortableMediaCard(item: GalleryMedia, isPlaying: Boolean) {
                         .decoderFactory(VideoFrameDecoder.Factory()).crossfade(true).build(),
                     contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
                 )
-                if (item.isVideo) Icon(Icons.Default.PlayArrow, null, tint = Color.White.copy(0.7f), modifier = Modifier.size(40.dp))
+                
+                if (item.isVideo) {
+                    Icon(
+                        imageVector = Icons.Default.VideoCameraBack,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.8f),
+                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).size(20.dp)
+                    )
+                    // 플레이 아이콘 클릭 시 수동 재생
+                    IconButton(onClick = onPlayClick) {
+                        Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(40.dp))
+                    }
+                }
+            }
+
+            Surface(
+                color = Color.Black.copy(alpha = 0.5f),
+                shape = MaterialTheme.shapes.extraSmall,
+                modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)
+            ) {
+                Text(text = item.resolutionText, color = Color.White, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
             }
         }
     }
@@ -239,8 +265,11 @@ fun VideoPlayerCore(uri: Uri) {
     }
     DisposableEffect(Unit) { onDispose { exoPlayer.release() } }
     AndroidView(
-        factory = { PlayerView(it).apply { player = exoPlayer; useController = false;
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM; setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) } },
+        factory = { PlayerView(it).apply { 
+            player = exoPlayer; useController = false; 
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM; 
+            setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) 
+        } },
         modifier = Modifier.fillMaxSize()
     )
 }
