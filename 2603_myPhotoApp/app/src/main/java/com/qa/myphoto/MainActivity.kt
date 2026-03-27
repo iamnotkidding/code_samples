@@ -17,7 +17,7 @@ import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.lazy.staggeredgrid.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -51,6 +51,7 @@ import coil.decode.VideoFrameDecoder
 import coil.request.CachePolicy
 import coil.request.ImageRequest
 import kotlinx.coroutines.*
+import kotlin.math.abs
 
 data class GalleryMedia(
     val id: String,
@@ -68,7 +69,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 PermissionCheckAPI34 {
-                    // 상태바 영역 침범 방지
                     Surface(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
                         MainGalleryApp()
                     }
@@ -131,7 +131,6 @@ fun MainGalleryApp() {
     val pagerState = rememberPagerState(pageCount = { tabs.size })
     val scope = rememberCoroutineScope()
     
-    // 레이아웃 전체 단수(열 개수) 컨트롤
     var columnCount by remember { mutableIntStateOf(3) }
     var isAutoScrollEnabled by remember { mutableStateOf(false) }
     val totalMedia = remember { mutableStateListOf<GalleryMedia>() }
@@ -175,7 +174,6 @@ fun MainGalleryApp() {
     Scaffold(
         topBar = {
             Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
-                // 상단 탭 (1손가락 스와이프 연동)
                 ScrollableTabRow(selectedTabIndex = pagerState.currentPage) {
                     tabs.forEachIndexed { i, title ->
                         Tab(selected = pagerState.currentPage == i, onClick = { scope.launch { pagerState.animateScrollToPage(i) } }) {
@@ -183,7 +181,6 @@ fun MainGalleryApp() {
                         }
                     }
                 }
-                // 레이아웃 컨트롤 패널
                 Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { if (columnCount < 5) columnCount++ }) { Icon(Icons.Default.Remove, "작게") }
                     Text("레이아웃 ${columnCount}단", fontSize = 16.sp, modifier = Modifier.padding(horizontal = 16.dp))
@@ -209,7 +206,7 @@ fun MainGalleryApp() {
                 }
             }
             
-            OptimalGaplessGrid(
+            DynamicReflowGrid(
                 items = filtered,
                 displayColumns = columnCount,
                 isAutoScroll = isAutoScrollEnabled,
@@ -221,59 +218,14 @@ fun MainGalleryApp() {
 }
 
 @Composable
-fun OptimalGaplessGrid(items: List<GalleryMedia>, displayColumns: Int, isAutoScroll: Boolean, onManualInteraction: () -> Unit, imageLoader: ImageLoader) {
-    val gridState = rememberLazyGridState()
+fun DynamicReflowGrid(items: List<GalleryMedia>, displayColumns: Int, isAutoScroll: Boolean, onManualInteraction: () -> Unit, imageLoader: ImageLoader) {
+    val gridState = rememberLazyStaggeredGridState()
     val scope = rememberCoroutineScope()
     var scrollDirection by remember { mutableIntStateOf(1) }
     var activeVideoId by remember { mutableStateOf<String?>(null) }
     
-    // 각 사진의 개별 확대/축소 레이아웃 스케일 저장 맵
+    // 개별 사진/동영상의 확대/축소 스케일을 저장하는 상태
     val itemScales = remember { mutableStateMapOf<String, Float>() }
-    
-    val totalGridCells = 60 
-
-    // [핵심] 빈 공간 완벽 제거 및 줌 레이아웃 재배치 알고리즘
-    val itemSpans = remember(items, displayColumns, itemScales.toMap()) {
-        if (items.isEmpty()) return@remember IntArray(0)
-        
-        val spans = IntArray(items.size)
-        var currentLineSpan = 0
-        val baseSpan = totalGridCells / displayColumns
-        
-        for (i in items.indices) {
-            val item = items[i]
-            val scale = itemScales[item.id] ?: 1f
-            
-            // 줌이 크게 당겨졌거나 1단 뷰일 경우 한 줄 전체를 차지하도록 요청
-            val preferredSpan = if (scale > 1.2f || displayColumns == 1) {
-                totalGridCells
-            } else if (item.isWide) {
-                (baseSpan * 1.5).toInt().coerceAtMost(totalGridCells)
-            } else {
-                baseSpan
-            }
-            
-            val remainingInLine = totalGridCells - currentLineSpan
-
-            // 만약 필요한 공간이 현재 줄에 남은 공간보다 크다면 줄바꿈이 일어납니다.
-            // 이때 빈 공간이 발생하는 것을 막기 위해 이전 아이템의 크기를 강제로 늘려 빈 공간을 없앱니다.
-            if (preferredSpan > remainingInLine) {
-                if (i > 0 && currentLineSpan > 0) {
-                    spans[i - 1] += remainingInLine
-                }
-                currentLineSpan = 0 
-            }
-            
-            spans[i] = preferredSpan.coerceAtMost(totalGridCells)
-            currentLineSpan = (currentLineSpan + spans[i]) % totalGridCells
-        }
-        
-        // 마지막 아이템이 줄을 다 못 채웠을 경우 빈 공간 100% 채움
-        if (currentLineSpan != 0 && items.isNotEmpty()) {
-            spans[items.lastIndex] += (totalGridCells - currentLineSpan)
-        }
-        spans
-    }
 
     LaunchedEffect(isAutoScroll, scrollDirection) {
         if (isAutoScroll) {
@@ -290,50 +242,62 @@ fun OptimalGaplessGrid(items: List<GalleryMedia>, displayColumns: Int, isAutoScr
         if (gridState.isScrollInProgress) onManualInteraction()
     }
 
+    // [해결 1] 자동 재생 로직 개선 (화면 중앙에 가장 가까운 비디오 찾기)
     val centerVideoId by remember {
         derivedStateOf {
             val layoutInfo = gridState.layoutInfo
             val visibleItems = layoutInfo.visibleItemsInfo
             if (visibleItems.isEmpty()) return@derivedStateOf null
-            visibleItems.firstOrNull { info ->
-                val isVideo = items.getOrNull(info.index)?.isVideo == true
-                isVideo && info.offset.y >= layoutInfo.viewportStartOffset && (info.offset.y + info.size.height) <= layoutInfo.viewportEndOffset
-            }?.key.toString()
+
+            // 현재 화면(뷰포트)의 정중앙 Y좌표 계산
+            val viewportCenter = (layoutInfo.viewportStartOffset + layoutInfo.viewportEndOffset) / 2
+
+            // 화면에 보이는 아이템 중 '비디오'이면서 중앙에 가장 가까운 항목 탐색
+            visibleItems.asSequence()
+                .filter { items.getOrNull(it.index)?.isVideo == true }
+                .minByOrNull { info ->
+                    val itemCenter = info.offset.y + (info.size.height / 2)
+                    abs(viewportCenter - itemCenter) // 중앙과의 거리 계산
+                }?.let { info ->
+                    items.getOrNull(info.index)?.id
+                }
         }
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        LazyVerticalGrid(
+        // [해결 2] 테트리스 배치를 완벽하게 지원하는 LazyVerticalStaggeredGrid 사용
+        LazyVerticalStaggeredGrid(
             state = gridState,
-            columns = GridCells.Fixed(totalGridCells),
+            columns = StaggeredGridCells.Fixed(displayColumns),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(0.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp),
+            verticalItemSpacing = 0.dp,
             horizontalArrangement = Arrangement.spacedBy(0.dp)
         ) {
-            itemsIndexed(
+            items(
                 items = items,
-                key = { _, item -> item.id },
-                span = { index, _ -> 
-                    // ArrayIndexOutOfBoundsException 완벽 차단 방어 코드
-                    val safeSpan = if (index < itemSpans.size) itemSpans[index] else totalGridCells / displayColumns
-                    GridItemSpan(maxOf(1, safeSpan))
+                key = { it.id },
+                span = { item ->
+                    val scale = itemScales[item.id] ?: 1f
+                    // 사용자가 줌 인을 해서 크기가 1.2배 이상 커지면, 레이아웃 계산 시 해당 사진이 한 줄(FullLine)을 강제로 차지하도록 재배치
+                    if (scale > 1.2f || (item.isWide && displayColumns > 1)) {
+                        StaggeredGridItemSpan.FullLine
+                    } else {
+                        StaggeredGridItemSpan.SingleLane
+                    }
                 }
-            ) { _, item ->
+            ) { item ->
                 val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
                 val layoutScale = itemScales[item.id] ?: 1f
-                val rowHeight = (360 / displayColumns).dp
                 
-                Box(Modifier.height(rowHeight)) {
-                    InteractiveMediaCard(
-                        item = item,
-                        isPlaying = isPlaying,
-                        layoutScale = layoutScale,
-                        onLayoutScaleChange = { newScale -> itemScales[item.id] = newScale },
-                        imageLoader = imageLoader,
-                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
-                    )
-                }
+                InteractiveMediaCard(
+                    item = item,
+                    isPlaying = isPlaying,
+                    layoutScale = layoutScale,
+                    onLayoutScaleChange = { newScale -> itemScales[item.id] = newScale },
+                    imageLoader = imageLoader,
+                    onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
+                )
             }
         }
 
@@ -370,16 +334,19 @@ fun InteractiveMediaCard(
     var visualScale by remember { mutableFloatStateOf(layoutScale) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
+    // 부모의 layoutScale이 변경되면 내부 시각적 스케일도 동기화
     LaunchedEffect(layoutScale) {
         if (!isZooming) visualScale = layoutScale
     }
 
     Card(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
             .zIndex(if (isZooming) 1f else 0f)
+            // [해결 2] 줌이 종료되어 layoutScale이 변경되면, AspectRatio(비율) 자체가 변하여 
+            // StaggeredGrid 내에서 세로 공간을 더 차지하도록 레이아웃을 밀어냄
+            .aspectRatio((item.ratio / layoutScale).coerceAtLeast(0.3f))
             .pointerInput(Unit) {
-                // 커스텀 2손가락 제스처 훅 (상하 스크롤과 완벽 분리)
                 detectTwoFingerZoomPanGesture(
                     onGestureStart = { isZooming = true },
                     onGesture = { pan, zoom ->
@@ -388,7 +355,7 @@ fun InteractiveMediaCard(
                     },
                     onGestureEnd = {
                         isZooming = false
-                        // 손을 떼는 순간 레이아웃 스케일에 반영 -> 화면 재배치 발생
+                        // 손을 떼면 시각적으로 커진 수치를 부모 레이아웃 엔진에 전달하여 재계산(Re-calculation) 트리거
                         onLayoutScaleChange(visualScale)
                         offset = Offset.Zero
                     }
@@ -397,6 +364,7 @@ fun InteractiveMediaCard(
         shape = RectangleShape,
         colors = CardDefaults.cardColors(containerColor = Color.Black)
     ) {
+        // 이미 레이아웃 크기가 커졌으므로, 내부 시각 렌더링 스케일은 1.0으로 부드럽게 초기화됨
         val renderScale = visualScale / layoutScale
 
         Box(
@@ -410,7 +378,6 @@ fun InteractiveMediaCard(
                 ),
             contentAlignment = Alignment.Center
         ) {
-            // ContentScale.Crop으로 빈 공간 없이 꽉 채움
             AsyncImage(
                 model = ImageRequest.Builder(context).data(item.uri).memoryCachePolicy(CachePolicy.ENABLED).crossfade(200).build(),
                 imageLoader = imageLoader,
@@ -437,7 +404,6 @@ fun InteractiveMediaCard(
     }
 }
 
-// 2손가락 전용 제스처 감지 함수 (스크롤 충돌 방지)
 suspend fun PointerInputScope.detectTwoFingerZoomPanGesture(
     onGestureStart: () -> Unit,
     onGesture: (pan: Offset, zoom: Float) -> Unit,
@@ -459,14 +425,13 @@ suspend fun PointerInputScope.detectTwoFingerZoomPanGesture(
                     val zoom = event.calculateZoom()
                     val pan = event.calculatePan()
                     onGesture(pan, zoom)
-                    // 이벤트를 소비하여 상하 스크롤 중지
                     event.changes.forEach { if (it.positionChanged()) it.consume() }
                 } else if (pointers.isEmpty()) {
                     break
                 }
             } while (true)
         } catch (e: CancellationException) {
-            // 제스처 도중 취소 시 예외 처리
+            // Cancelled
         } finally {
             if (hasStartedTwoFinger) {
                 onGestureEnd()
