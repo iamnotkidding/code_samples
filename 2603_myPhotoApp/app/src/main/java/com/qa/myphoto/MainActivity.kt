@@ -55,7 +55,7 @@ data class GalleryMedia(
     val isOnline: Boolean,
     val ratio: Float,
     val resolutionText: String,
-    val spanWeight: Int // 1: 일반, 2: 와이드(빈 공간 매움용)
+    val isWide: Boolean
 )
 
 class MainActivity : ComponentActivity() {
@@ -119,18 +119,11 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
                     val isVideo = (cursor.getString(mimeCol) ?: "").startsWith("video")
                     val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
                     
-                    // [반영] 비율이 크면 가로 2칸 점유 가중치를 부여하여 빈 공간을 스스로 메우도록 함
-                    val span = if (ratio > 1.4f && id % 3 == 0L) 2 else 1
-                    localItems.add(GalleryMedia("local_$id", uri, isVideo, false, ratio, "${w}x${h}", span))
+                    // 가로 비율이 1.5 이상이면 와이드 파일로 분류
+                    localItems.add(GalleryMedia("local_$id", uri, isVideo, false, ratio, "${w}x${h}", ratio > 1.5f))
                 }
             }
             withContext(Dispatchers.Main) { totalMedia.addAll(localItems) }
-        }
-        // 온라인 샘플 로딩
-        launch(Dispatchers.IO) {
-            delay(1000)
-            val remoteItems = List(5) { i -> GalleryMedia("online_$i", Uri.parse("https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"), true, true, 1.77f, "1920x1080", 2) }
-            withContext(Dispatchers.Main) { totalMedia.addAll(remoteItems) }
         }
     }
 
@@ -144,39 +137,28 @@ fun MainGalleryApp(initialTab: String, initialAutoScroll: Boolean, initialZoom: 
                         }
                     }
                 }
-                Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+                Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
                     Text(if (isAutoScrollEnabled) "자동 스크롤 중" else "자동 스크롤 시작")
                 }
             }
         }
     ) { padding ->
-        // [반영] 한 손가락 좌우 스와이프로 탭 이동
-        HorizontalPager(
-            state = pagerState, 
-            modifier = Modifier.padding(padding).fillMaxSize(),
-            userScrollEnabled = true 
-        ) { pageIdx ->
+        HorizontalPager(state = pagerState, modifier = Modifier.padding(padding).fillMaxSize()) { pageIdx ->
             val filtered = when (pageIdx) {
                 1 -> totalMedia.filter { !it.isVideo }
                 2 -> totalMedia.filter { it.isVideo }
-                3 -> totalMedia.filter { !it.isOnline }
-                4 -> totalMedia.filter { it.isOnline }
                 else -> totalMedia
             }
-            GapFillingComfortableGrid(filtered, isAutoScrollEnabled, videoImageLoader, initialZoom)
+            ComfortableGaplessGrid(filtered, isAutoScrollEnabled, videoImageLoader, initialZoom)
         }
     }
 }
 
 @Composable
-fun GapFillingComfortableGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialColumns: Int) {
+fun ComfortableGaplessGrid(items: List<GalleryMedia>, isEnabled: Boolean, imageLoader: ImageLoader, initialColumns: Int) {
     val gridState = rememberLazyStaggeredGridState()
-    val scope = rememberCoroutineScope()
-    
-    // [반영] 두 손가락 줌으로 레이아웃 레벨(칸 수) 변경
     var columnCount by remember { mutableFloatStateOf(initialColumns.toFloat()) }
     val displayColumns = columnCount.toInt().coerceIn(1, 5)
-    
     var scrollDirection by remember { mutableIntStateOf(1) }
     var manualPlayId by remember { mutableStateOf<String?>(null) }
 
@@ -198,45 +180,35 @@ fun GapFillingComfortableGrid(items: List<GalleryMedia>, isEnabled: Boolean, ima
             if (visibleItems.isEmpty()) return@derivedStateOf null
             visibleItems.firstOrNull { info ->
                 val isVideo = items.getOrNull(info.index)?.isVideo == true
-                isVideo && info.offset.y >= layoutInfo.viewportStartOffset && (info.offset.y + info.size.height) <= layoutInfo.viewportEndOffset
+                val isFullyVisible = info.offset.y >= layoutInfo.viewportStartOffset && (info.offset.y + info.size.height) <= layoutInfo.viewportEndOffset
+                isVideo && isFullyVisible
             }?.key.toString()
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) { // 배경을 검은색으로 하여 흰 공간 방지
         LazyVerticalStaggeredGrid(
             state = gridState,
             columns = StaggeredGridCells.Fixed(displayColumns),
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
-                    // [반영] 핀치 제스처 감지 및 레이아웃 레벨 변경
                     detectTransformGestures { _, _, zoom, _ ->
                         columnCount = (columnCount / zoom).coerceIn(1f, 5.9f)
                     }
                 },
-            contentPadding = PaddingValues(1.dp),
-            verticalItemSpacing = 1.dp,
-            horizontalArrangement = Arrangement.spacedBy(1.dp)
+            contentPadding = PaddingValues(0.dp), // 간격 제거
+            verticalItemSpacing = 0.dp,
+            horizontalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             items(items, key = { it.id }, span = { item ->
-                // [반영] 남는 공간에 맞춰 비율을 변경하거나 Span을 확장하여 빈 공간 제거
-                if (item.spanWeight > 1 && displayColumns >= 2) {
-                    StaggeredGridItemSpan.FullLine 
-                } else {
-                    StaggeredGridItemSpan.SingleLane
-                }
+                // 가로 크기 다양화: 와이드 파일은 가로 전체 차지 유도 (칸수가 2개 이상일 때)
+                if (item.isWide && displayColumns > 1) StaggeredGridItemSpan.FullLine else StaggeredGridItemSpan.SingleLane
             }) { item ->
                 val isPlaying = item.id == manualPlayId || (manualPlayId == null && item.id == activeVideoId)
-                SeamlessCard(item, isPlaying, imageLoader) {
+                GaplessMediaCard(item, isPlaying, imageLoader) {
                     manualPlayId = if (manualPlayId == item.id) null else item.id
                 }
-            }
-        }
-
-        if (gridState.firstVisibleItemIndex > 2) {
-            FloatingActionButton(onClick = { scope.launch { gridState.animateScrollToItem(0) } }, modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp).size(44.dp)) {
-                Icon(Icons.Default.ArrowUpward, null)
             }
         }
     }
@@ -244,32 +216,50 @@ fun GapFillingComfortableGrid(items: List<GalleryMedia>, isEnabled: Boolean, ima
 
 @OptIn(UnstableApi::class)
 @Composable
-fun SeamlessCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: ImageLoader, onPlayClick: () -> Unit) {
+fun GaplessMediaCard(item: GalleryMedia, isPlaying: Boolean, imageLoader: ImageLoader, onPlayClick: () -> Unit) {
     val context = LocalContext.current
-    Card(modifier = Modifier.fillMaxWidth().wrapContentHeight(), shape = RectangleShape) {
+    
+    // 강제로 화면 비율에 맞춰 확장 (흰 공간 제거 핵심)
+    Card(
+        modifier = Modifier.fillMaxWidth().wrapContentHeight(), 
+        shape = RectangleShape,
+        colors = CardDefaults.cardColors(containerColor = Color.Black)
+    ) {
         Box(modifier = Modifier.aspectRatio(item.ratio), contentAlignment = Alignment.Center) {
-            if (item.isVideo && isPlaying) {
-                VideoPlayerCore(item.uri)
-            } else {
-                AsyncImage(
-                    model = ImageRequest.Builder(context).data(item.uri).memoryCachePolicy(CachePolicy.ENABLED).crossfade(true).build(),
-                    imageLoader = imageLoader,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize().background(Color.DarkGray)
-                )
-                if (item.isVideo) {
-                    Icon(Icons.Default.VideoCameraBack, null, tint = Color.White.copy(0.7f), modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(18.dp))
-                    IconButton(onClick = onPlayClick) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(32.dp)) }
+            // 썸네일을 항상 배경에 깔아두어 플레이어 전환 시 깜빡임 방지
+            AsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(item.uri)
+                    .memoryCachePolicy(CachePolicy.ENABLED)
+                    .crossfade(200) // 부드러운 전환
+                    .build(),
+                imageLoader = imageLoader,
+                contentDescription = null,
+                contentScale = ContentScale.Crop, // 빈 공간 없이 채움
+                modifier = Modifier.fillMaxSize()
+            )
+            
+            if (item.isVideo) {
+                if (isPlaying) {
+                    VideoPlayerCore(item.uri)
+                } else {
+                    Icon(
+                        Icons.Default.VideoCameraBack, null, 
+                        tint = Color.White.copy(0.7f), 
+                        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).size(20.dp)
+                    )
+                    IconButton(onClick = onPlayClick) {
+                        Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(40.dp))
+                    }
                 }
             }
-            Surface(color = Color.Black.copy(alpha = 0.4f), modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)) {
-                Text(text = item.resolutionText, color = Color.White, fontSize = 7.sp, modifier = Modifier.padding(horizontal = 3.dp))
-            }
-            if (item.isOnline) {
-                Surface(color = MaterialTheme.colorScheme.primary.copy(0.8f), modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp)) {
-                    Text(text = "온라인", color = Color.White, fontSize = 7.sp, modifier = Modifier.padding(horizontal = 4.dp))
-                }
+            
+            // 해상도 표시
+            Surface(
+                color = Color.Black.copy(alpha = 0.5f), 
+                modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)
+            ) {
+                Text(text = item.resolutionText, color = Color.White, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 4.dp))
             }
         }
     }
@@ -294,8 +284,8 @@ fun VideoPlayerCore(uri: Uri) {
             PlayerView(ctx).apply {
                 player = exoPlayer
                 useController = false
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM // 비디오도 꽉 채움
+                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT) // 준비 중 검은 화면 방지
             }
         },
         modifier = Modifier.fillMaxSize()
