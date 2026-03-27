@@ -197,7 +197,6 @@ fun MainGalleryApp() {
                     
                     Spacer(modifier = Modifier.weight(1f))
                     
-                    // [요구사항 2] 텍스트 변경
                     Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }) {
                         Text(if (isAutoScrollEnabled) "정지" else "자동")
                     }
@@ -213,7 +212,7 @@ fun MainGalleryApp() {
                 when (pageIdx) {
                     1 -> totalMedia.filter { !it.isVideo }
                     2 -> totalMedia.filter { it.isVideo }
-                    3 -> totalMedia.filter { it.isVideo }
+                    3 -> totalMedia.filter { it.isVideo } // 커스텀 탭(임시로 비디오만 노출, 추후 선택 로직 확장 가능)
                     else -> totalMedia
                 }
             }
@@ -225,7 +224,6 @@ fun MainGalleryApp() {
                 isAutoScroll = isAutoScrollEnabled,
                 onManualInteraction = { isAutoScrollEnabled = false },
                 imageLoader = videoImageLoader,
-                // [요구사항 1] 커스텀 탭(인덱스 3)인지 여부를 전달
                 isCustomTab = pageIdx == 3
             )
         }
@@ -250,7 +248,6 @@ fun OptimalReflowGrid(
     // 120칸 공배수 분할 (비율 정밀 계산용)
     val totalGridCells = 120 
 
-    // [요구사항 3, 4] 축소/확대 크기에 맞춰 정확한 영역을 차지하고, 남는 공간은 이전/다음 아이템이 강제로 채움
     val itemSpans = remember(items, displayColumns, itemScales.toMap()) {
         if (items.isEmpty()) return@remember IntArray(0)
         
@@ -325,9 +322,10 @@ fun OptimalReflowGrid(
             state = gridState,
             columns = GridCells.Fixed(totalGridCells),
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(0.dp),
-            verticalArrangement = Arrangement.spacedBy(0.dp),
-            horizontalArrangement = Arrangement.spacedBy(0.dp)
+            // 사진과 영상 파일 사이 2.dp 간격(여백) 추가 적용
+            contentPadding = PaddingValues(2.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             itemsIndexed(
                 items = items,
@@ -349,10 +347,11 @@ fun OptimalReflowGrid(
                         item = item,
                         isPlaying = isPlaying,
                         layoutScale = currentScale,
+                        displayColumns = displayColumns,
                         onScaleChange = { newScale -> itemScales[item.id] = newScale },
                         imageLoader = imageLoader,
                         onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id },
-                        isCustomTab = isCustomTab // 커스텀 탭 여부 전달
+                        isCustomTab = isCustomTab 
                     )
                 }
             }
@@ -374,7 +373,6 @@ fun OptimalReflowGrid(
             }
         }
 
-        // [요구사항 1] 커스텀 탭일 때만 하단 정밀 슬라이더 패널 노출
         if (isCustomTab && activeVideoId != null) {
             val scale = itemScales[activeVideoId] ?: 1f
             Column(
@@ -409,6 +407,7 @@ fun DynamicRatioMediaCard(
     item: GalleryMedia, 
     isPlaying: Boolean, 
     layoutScale: Float,
+    displayColumns: Int,
     onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
     onPlayToggle: () -> Unit,
@@ -428,9 +427,13 @@ fun DynamicRatioMediaCard(
         }
     }
 
+    val isFullLine = layoutScale > 1.2f || (item.isWide && displayColumns > 1)
+    val widthMultiplier = if (isFullLine && displayColumns > 1) displayColumns.toFloat() else 1f
+    val targetRatio = ((item.ratio * widthMultiplier) / layoutScale).coerceIn(0.2f, 5f)
+
     Card(
         modifier = Modifier
-            .fillMaxSize() // Box 크기에 맞게 채움
+            .fillMaxSize() 
             .zIndex(if (isZooming || showInCardSlider) 1f else 0f)
             .pointerInput(Unit) {
                 detectTwoFingerGesture(
@@ -501,7 +504,6 @@ fun DynamicRatioMediaCard(
                 )
             }
 
-            // [요구사항 1] 정밀 제어 튜닝 버튼은 '커스텀' 탭에서만 보임
             if (isCustomTab) {
                 IconButton(
                     onClick = { showInCardSlider = !showInCardSlider },
