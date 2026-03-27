@@ -18,9 +18,8 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.staggeredgrid.*
+import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -41,6 +40,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -58,7 +58,6 @@ data class GalleryMedia(
     val id: String,
     val uri: Uri,
     val isVideo: Boolean,
-    val ratio: Float,
     val resolutionText: String,
     val isWide: Boolean
 )
@@ -67,11 +66,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
         setContent {
             MaterialTheme {
                 PermissionCheck {
-                    // [해결 1] 상태바(알림창) 영역 침범 방지
                     Surface(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
                         MainGalleryApp()
                     }
@@ -102,8 +99,8 @@ fun MainGalleryApp() {
     val pagerState = rememberPagerState(pageCount = { tabs.size })
     val scope = rememberCoroutineScope()
     
+    // [요구사항 7] 레이아웃 줌 레벨 (버튼으로만 조절)
     var columnCount by remember { mutableIntStateOf(3) }
-    var isAutoScrollEnabled by remember { mutableStateOf(false) }
     val totalMedia = remember { mutableStateListOf<GalleryMedia>() }
 
     LaunchedEffect(Unit) {
@@ -119,10 +116,11 @@ fun MainGalleryApp() {
                     val id = cursor.getLong(idCol)
                     val w = cursor.getInt(wCol).coerceAtLeast(1)
                     val h = cursor.getInt(hCol).coerceAtLeast(1)
-                    val ratio = w.toFloat() / h
                     val isVideo = (cursor.getString(mimeCol) ?: "").startsWith("video")
                     val uri = ContentUris.withAppendedId(if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                    localItems.add(GalleryMedia("local_$id", uri, isVideo, ratio, "${w}x${h}", ratio > 1.3f))
+                    
+                    // 가로가 긴 사진 판별
+                    localItems.add(GalleryMedia("local_$id", uri, isVideo, "${w}x${h}", w.toFloat() / h > 1.3f))
                 }
             }
             withContext(Dispatchers.Main) { totalMedia.addAll(localItems) }
@@ -132,6 +130,7 @@ fun MainGalleryApp() {
     Scaffold(
         topBar = {
             Column(Modifier.background(MaterialTheme.colorScheme.surface)) {
+                // [요구사항 4] 탭 UI
                 ScrollableTabRow(selectedTabIndex = pagerState.currentPage) {
                     tabs.forEachIndexed { i, title ->
                         Tab(selected = pagerState.currentPage == i, onClick = { scope.launch { pagerState.animateScrollToPage(i) } }) {
@@ -139,19 +138,16 @@ fun MainGalleryApp() {
                         }
                     }
                 }
-                Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = { if (columnCount < 5) columnCount++ }) { Icon(Icons.Default.Remove, "열 늘리기") }
-                    Text("${columnCount}단", fontSize = 14.sp, modifier = Modifier.padding(horizontal = 8.dp))
-                    IconButton(onClick = { if (columnCount > 1) columnCount-- }) { Icon(Icons.Default.Add, "열 줄이기") }
-                    
-                    Spacer(Modifier.weight(1f))
-                    Button(onClick = { isAutoScrollEnabled = !isAutoScrollEnabled }) {
-                        Text(if (isAutoScrollEnabled) "스크롤 중단" else "자동 스크롤")
-                    }
+                // [요구사항 7] 별도의 버튼으로 레이아웃 줌 레벨 컨트롤
+                Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { if (columnCount < 5) columnCount++ }) { Icon(Icons.Default.Remove, "작게 보기") }
+                    Text("레이아웃 ${columnCount}단", fontSize = 16.sp, modifier = Modifier.padding(horizontal = 16.dp))
+                    IconButton(onClick = { if (columnCount > 1) columnCount-- }) { Icon(Icons.Default.Add, "크게 보기") }
                 }
             }
         }
     ) { padding ->
+        // [요구사항 4] 한 손가락 좌우 스와이프 탭 이동
         HorizontalPager(
             state = pagerState, 
             modifier = Modifier.padding(padding).fillMaxSize()
@@ -162,11 +158,9 @@ fun MainGalleryApp() {
                 else -> totalMedia
             }
             
-            StrictGaplessGrid(
+            StrictGaplessRowGrid(
                 items = filtered,
-                columns = columnCount,
-                isAutoScroll = isAutoScrollEnabled,
-                onManualInteraction = { isAutoScrollEnabled = false },
+                displayColumns = columnCount,
                 imageLoader = videoImageLoader
             )
         }
@@ -174,31 +168,15 @@ fun MainGalleryApp() {
 }
 
 @Composable
-fun StrictGaplessGrid(items: List<GalleryMedia>, columns: Int, isAutoScroll: Boolean, onManualInteraction: () -> Unit, imageLoader: ImageLoader) {
-    val gridState = rememberLazyStaggeredGridState()
+fun StrictGaplessRowGrid(items: List<GalleryMedia>, displayColumns: Int, imageLoader: ImageLoader) {
+    val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
-    var scrollDirection by remember { mutableIntStateOf(1) }
     var activeVideoId by remember { mutableStateOf<String?>(null) }
     
-    // [해결 3] 각 아이템의 줌 레벨을 기억하는 상태 맵
-    val itemScales = remember { mutableStateMapOf<String, Float>() }
+    // 그리드 세분화: 60칸으로 쪼개서 비율을 유동적으로 분배 (공배수 활용)
+    val totalGridCells = 60 
 
-    LaunchedEffect(isAutoScroll, scrollDirection) {
-        if (isAutoScroll) {
-            while (isActive) {
-                if (scrollDirection == 1 && !gridState.canScrollForward) scrollDirection = -1
-                else if (scrollDirection == -1 && !gridState.canScrollBackward) scrollDirection = 1
-                gridState.scrollBy(3f * scrollDirection)
-                delay(16)
-            }
-        }
-    }
-
-    LaunchedEffect(gridState.isScrollInProgress) {
-        if (gridState.isScrollInProgress) onManualInteraction()
-    }
-
-    // [해결 4] 화면 중앙에 위치한 영상을 감지하여 자동 재생
+    // 화면 중앙에 위치한 영상을 감지하여 자동 재생
     val centerVideoId by remember {
         derivedStateOf {
             val layoutInfo = gridState.layoutInfo
@@ -212,38 +190,42 @@ fun StrictGaplessGrid(items: List<GalleryMedia>, columns: Int, isAutoScroll: Boo
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        LazyVerticalStaggeredGrid(
+        // [요구사항 1, 5] 한 손가락 상하 스크롤 처리 및 그리드 배치
+        LazyVerticalGrid(
             state = gridState,
-            columns = StaggeredGridCells.Fixed(columns),
+            columns = GridCells.Fixed(totalGridCells),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(0.dp),
-            verticalItemSpacing = 0.dp,
+            verticalArrangement = Arrangement.spacedBy(0.dp),
             horizontalArrangement = Arrangement.spacedBy(0.dp)
         ) {
-            items(items, key = { it.id }, span = { item ->
-                val scale = itemScales[item.id] ?: 1f
-                // [해결 3] 줌 레벨이 1.2를 넘어가면 가로 전체 폭(FullLine)을 차지하도록 재배치하여 겹침 방지
-                if (scale > 1.2f || item.isWide || columns == 1) {
-                    StaggeredGridItemSpan.FullLine 
-                } else {
-                    StaggeredGridItemSpan.SingleLane
-                }
-            }) { item ->
-                val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
-                val currentScale = itemScales[item.id] ?: 1f
+            itemsIndexed(items, key = { _, item -> item.id }) { index, item ->
+                // [요구사항 2] 공간이 남으면 강제로 비율을 조정하여 남은 공간에 맞춤
+                val baseSpan = totalGridCells / displayColumns
+                val preferredSpan = if (item.isWide) (baseSpan * 1.5).toInt().coerceAtMost(totalGridCells) else baseSpan
                 
-                InteractiveMediaCard(
-                    item = item,
-                    isPlaying = isPlaying,
-                    scale = currentScale,
-                    onScaleChange = { newScale -> itemScales[item.id] = newScale },
-                    imageLoader = imageLoader,
-                    onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
-                )
+                // 현재 줄(Row)의 남은 칸수(maxCurrentLineSpan)보다 선호하는 크기가 크거나,
+                // 리스트의 가장 마지막 아이템일 경우 무조건 남은 칸을 100% 채워서 빈 공간을 소멸시킴
+                val isLastItem = index == items.lastIndex
+                val actualSpan = if (maxCurrentLineSpan < preferredSpan || isLastItem) maxCurrentLineSpan else preferredSpan
+                
+                val isPlaying = item.id == activeVideoId || (activeVideoId == null && item.id == centerVideoId)
+                
+                // 행의 높이를 열 개수에 반비례하도록 일정하게 고정하여 조화로운 타일(Masonry) 느낌 제공
+                val rowHeight = (360 / displayColumns).dp
+                
+                Box(Modifier.height(rowHeight)) {
+                    ZoomableMediaCard(
+                        item = item,
+                        isPlaying = isPlaying,
+                        imageLoader = imageLoader,
+                        onPlayToggle = { activeVideoId = if (activeVideoId == item.id) null else item.id }
+                    )
+                }
             }
         }
 
-        // 최상단/최하단 퀵 이동 버튼
+        // [요구사항 6] 상하 끝으로 한 번에 이동하는 퀵 버튼
         Column(
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -264,56 +246,61 @@ fun StrictGaplessGrid(items: List<GalleryMedia>, columns: Int, isAutoScroll: Boo
 
 @OptIn(UnstableApi::class)
 @Composable
-fun InteractiveMediaCard(
+fun ZoomableMediaCard(
     item: GalleryMedia, 
     isPlaying: Boolean, 
-    scale: Float, 
-    onScaleChange: (Float) -> Unit, 
     imageLoader: ImageLoader, 
     onPlayToggle: () -> Unit
 ) {
     val context = LocalContext.current
+    var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
     Card(
         modifier = Modifier
-            .fillMaxWidth()
-            // [해결 3] scale이 커질수록 aspectRatio가 줄어들어 세로 길이가 길어짐 -> 겹치지 않고 레이아웃을 밀어냄
-            .aspectRatio((item.ratio / scale).coerceAtLeast(0.2f))
+            .fillMaxSize()
+            // 줌 인 시 다른 아이템 위에 그려지도록 Z축 우선순위 부여
+            .zIndex(if (scale > 1f) 1f else 0f)
             .pointerInput(Unit) {
-                // [해결 2] 1손가락 스크롤과 2손가락 줌 분리
+                // [요구사항 3] 두 손가락 터치로만 동작하는 줌 인/아웃 및 이동 제스처
                 detectTwoFingerGesture { pan, zoom ->
-                    val newScale = (scale * zoom).coerceIn(1f, 4f)
-                    onScaleChange(newScale)
-                    if (newScale > 1f) offset += pan else offset = Offset.Zero
+                    scale = (scale * zoom).coerceIn(1f, 4f)
+                    if (scale > 1f) offset += pan else offset = Offset.Zero
                 }
             },
         shape = RectangleShape,
         colors = CardDefaults.cardColors(containerColor = Color.Black)
     ) {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            val modifierWithPan = Modifier
+        Box(
+            modifier = Modifier
                 .fillMaxSize()
-                .graphicsLayer(translationX = offset.x, translationY = offset.y)
-
-            // 깜빡임 방지용 배경 썸네일
+                .graphicsLayer(
+                    scaleX = scale,
+                    scaleY = scale,
+                    translationX = offset.x,
+                    translationY = offset.y
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            // [요구사항 2] ContentScale.Crop으로 할당된 공간(찌그러지거나 늘어난 비율)을 흰색 여백 없이 가득 채움
             AsyncImage(
                 model = ImageRequest.Builder(context).data(item.uri).memoryCachePolicy(CachePolicy.ENABLED).crossfade(200).build(),
                 imageLoader = imageLoader,
                 contentDescription = null,
                 contentScale = ContentScale.Crop, 
-                modifier = modifierWithPan
+                modifier = Modifier.fillMaxSize()
             )
             
             if (item.isVideo) {
                 if (isPlaying) {
-                    VideoPlayerCore(item.uri, modifierWithPan)
+                    VideoPlayerCore(item.uri)
                 } else {
                     Icon(Icons.Default.VideoCameraBack, null, tint = Color.White.copy(0.7f), modifier = Modifier.align(Alignment.TopEnd).padding(6.dp).size(20.dp))
                     IconButton(onClick = onPlayToggle) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(48.dp)) }
                 }
             }
             
+            // 확대되지 않았을 때만 해상도 정보 표시
             if (scale == 1f) {
                 Surface(color = Color.Black.copy(alpha = 0.5f), modifier = Modifier.align(Alignment.BottomStart).padding(4.dp)) {
                     Text(text = item.resolutionText, color = Color.White, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 4.dp))
@@ -323,18 +310,19 @@ fun InteractiveMediaCard(
     }
 }
 
-// [해결 2] 2개 이상의 손가락이 닿았을 때만 이벤트를 가로채는 커스텀 제스처 디텍터
+// [요구사항 3, 5 충돌 방지] 오직 두 개 이상의 손가락이 터치되었을 때만 줌/팬 이벤트를 처리하는 커스텀 디텍터
 suspend fun PointerInputScope.detectTwoFingerGesture(onGesture: (pan: Offset, zoom: Float) -> Unit) {
     awaitEachGesture {
         awaitFirstDown(requireUnconsumed = false)
         do {
             val event = awaitPointerEvent()
             val pointers = event.changes.filter { it.pressed }
+
             if (pointers.size >= 2) {
                 val zoom = event.calculateZoom()
                 val pan = event.calculatePan()
                 onGesture(pan, zoom)
-                // 2손가락 이상일 때만 이벤트를 소비하여 1손가락 스크롤은 방해받지 않음
+                // 이벤트를 소비하여 상하 스크롤 뷰가 움직이지 않도록 차단
                 event.changes.forEach { if (it.positionChanged()) it.consume() }
             }
         } while (pointers.isNotEmpty())
@@ -343,7 +331,7 @@ suspend fun PointerInputScope.detectTwoFingerGesture(onGesture: (pan: Offset, zo
 
 @OptIn(UnstableApi::class)
 @Composable
-fun VideoPlayerCore(uri: Uri, modifier: Modifier) {
+fun VideoPlayerCore(uri: Uri) {
     val context = LocalContext.current
     val exoPlayer = remember(uri) {
         ExoPlayer.Builder(context).build().apply {
@@ -360,10 +348,10 @@ fun VideoPlayerCore(uri: Uri, modifier: Modifier) {
             PlayerView(ctx).apply {
                 player = exoPlayer
                 useController = false
-                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM // 비디오 역시 빈 공간 없이 꽉 채움
                 setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
             }
         },
-        modifier = modifier
+        modifier = Modifier.fillMaxSize()
     )
 }
